@@ -1,13 +1,13 @@
 # agy-automode
 
-Claude-style auto mode for [Antigravity](https://antigravity.google) (`agy`), including its sessions in [T3 Code](https://github.com/pingdotgg/t3code).
+Antigravity's "Auto" mode is dumb — it keeps nagging you for every `ssh`, pipe, or MCP call it doesn't recognize. So I rebuilt [Claude Code's auto mode](https://www.anthropic.com/engineering/claude-code-auto-mode) as an [Antigravity](https://antigravity.google) (`agy`) plugin (works in terminal `agy` and [T3 Code](https://github.com/pingdotgg/t3code)).
 
-`agy`'s built-in Auto mode prompts on almost every command outside a small fixed list (`ssh`, pipes, MCP tools). This plugin adds a transcript classifier based on the design Anthropic shared in their [Claude Code auto mode blog post](https://www.anthropic.com/engineering/claude-code-auto-mode):
+### How the loop works
 
-1. **Fast filter (no LLM):** Reads, search, task/T3 tools, workspace edits, and simple read-only commands (`ls`, `git status`, …) pass untouched.
+1. **Fast skip (no LLM):** A built-in safe list (reads, search, workspace edits, T3 tools, simple read-only commands like `ls` or `git status`) skips Claude and goes straight to `agy`.
 2. **Stage 1 (quick check, ~2 s):** Claude (`claude -p`, Sonnet by default) sees only **your messages and tool calls** — `ALLOW` runs immediately, `BLOCK` goes to stage 2.
-3. **Stage 2 (reasoned check, ~6 s):** Re-evaluates blocks carefully — either `ALLOW`, or `BLOCK` back to the agent as "automatic check, not the user" so it can explain and let you reply `"yes, you may run …"`.
-4. **Human fallback:** After **3 blocks in a row** or **20 in a conversation**, you decide (`force_ask`).
+3. **Stage 2 (reasoned check, ~6 s):** Double-checks flagged actions — either `ALLOW`, or denies it back to the agent as "automatic check, not the user" so it explains what it wants to run and lets you reply `"yes, you may run …"`.
+4. **Human fallback:** After **3 denials in a row** or **20 in a conversation**, it stops deciding and asks you (`force_ask`).
 
 ## How it compares
 
@@ -18,8 +18,8 @@ Claude-style auto mode for [Antigravity](https://antigravity.google) (`agy`), in
 | Blind to agent prose & tool outputs | ✅ | ❌ *(sees full trajectory)* | ✅ |
 | Two-stage check (fast → reasoned) | ✅ | ✅ | ✅ *(~2 s → ~6 s)* |
 | Approves safe MCP & unknown commands | ✅ | ❌ *(prompts by default)* | ⚠️ *(yes, stays in sandbox)* |
-| On block: reason to agent instead of popup | ✅ | ❌ *(popup or turn abort)* | ✅ |
-| Escalates only after 3 in a row / 20 total | ✅ | ❌ *(prompts immediately)* | ✅ |
+| On denial: reason to agent instead of popup | ✅ | ❌ *(popup or turn abort)* | ✅ |
+| Escalates only after 3 denials in a row / 20 total | ✅ | ❌ *(prompts immediately)* | ✅ |
 | Scans tool outputs for prompt injection | ✅ | ⚠️ *(undocumented)* | ❌ |
 
 **Safeguards:**
