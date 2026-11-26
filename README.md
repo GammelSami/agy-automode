@@ -4,9 +4,9 @@
 
 ### How the loop works
 
-1. **Whitelist:** common commands pass immediately (without LLM).
+1. **Whitelist:** common read-only commands and workspace edits pass immediately (without LLM), except reads of credential paths (`~/.ssh`, `.env`, …) and edits of agent config (`.gemini`, `AGENTS.md`, `.git`, …).
 2. **Stage 1 (~2 s):** LLM checks only your messages + the tool call → `ALLOW` or escalate.
-3. **Stage 2 (~6 s):** Double-checks flagged calls (with thinking) → `ALLOW`, or deny with a reason so the agent can ask you.
+3. **Stage 2 (~6 s):** Double-checks flagged calls (with thinking) → `ALLOW`, or deny with the rule name and what you would have to say to allow it.
 4. **Human fallback:** After 3 denials in a row (or 20 total), `agy` asks you directly.
 
 ## How it compares
