@@ -6,6 +6,7 @@ edits inside the workspace pass untouched; everything else goes to a transcript 
 running on Claude (`claude -p`), modelled on https://www.anthropic.com/engineering/claude-code-auto-mode:
 it sees only the user's messages and the agent's tool calls, never tool output or the agent's
 own prose. A fast one-word pass decides; only a BLOCK gets a second, reasoned pass.
+Without Claude, the classifier runs on Gemini through `agy -p` instead (AUTOMODE_BACKEND=agy).
 
 Printing nothing means "no opinion": agy then applies its normal policy (and T3 asks the human).
 Every failure ends that way, so a broken classifier never approves anything.
@@ -21,10 +22,17 @@ import sys
 import tempfile
 import time
 
-MODEL = os.environ.get('AUTOMODE_MODEL', 'sonnet')
+def find(name):
+    """Hooks may run with a PATH that lacks ~/.local/bin, where both CLIs install by default."""
+    fallback = Path.home() / '.local/bin' / name
+    return shutil.which(name) or (str(fallback) if fallback.exists() else None)
+
+
+BACKEND = os.environ.get('AUTOMODE_BACKEND') or ('claude' if find('claude') else 'agy')
+MODEL = os.environ.get('AUTOMODE_MODEL') or {'claude': 'sonnet', 'agy': 'gemini-4-neon-low'}.get(BACKEND, '')
 STATE = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'agy-automode'
 MAX_CONSECUTIVE_DENIALS, MAX_TOTAL_DENIALS = 3, 20
-CLAUDE_TIMEOUT = 40
+TIMEOUT = 40
 
 PASS_TOOLS = {'read_file', 'view_file', 'list_dir', 'grep_search', 'find_by_name', 'search_web',
               'codebase_search', 'view_file_outline', 'view_code_item', 'update_steps', 'manage_task'}
@@ -197,23 +205,42 @@ def classifier_input(data):
 
 
 def claude(system, prompt, schema=None):
-    binary = shutil.which('claude') or str(Path.home() / '.local/bin/claude')
+    binary = find('claude') or 'claude'
     command = [binary, '-p', '--model', MODEL, '--setting-sources', '', '--strict-mcp-config', '--tools', '',
                '--disable-slash-commands', '--no-session-persistence', '--system-prompt', system]
     if schema:
         command += ['--output-format', 'json', '--json-schema', json.dumps(schema)]
-    result = subprocess.run(command, input=prompt, capture_output=True, text=True, timeout=CLAUDE_TIMEOUT,
+    result = subprocess.run(command, input=prompt, capture_output=True, text=True, timeout=TIMEOUT,
                             cwd=tempfile.gettempdir())
     if result.returncode != 0:
         raise RuntimeError(f'claude exited {result.returncode}: {result.stderr[-300:]}')
     return result.stdout
 
 
+def agy(system, prompt, schema=None):
+    """Gemini via a headless agy turn. agy has no system prompt flag and ignores stdin, so both go
+    into the prompt argument. Plan mode keeps the classifier from running tools (default print mode
+    runs commands), so slash commands must stay enabled: agy ignores --mode plan without them."""
+    binary = find('agy') or 'agy'
+    with tempfile.TemporaryDirectory(prefix='agy-automode-') as folder:
+        command = [binary, '--model', MODEL, '--mode', 'plan', '--sandbox', '--log-file', f'{folder}/agy.log',
+                   '-p', system + '\n\n' + prompt]
+        if schema:
+            command[-2:-2] = ['--output-format', 'json', '--json-schema', json.dumps(schema)]
+        # The child agy loads this plugin too; it must not classify its own turn.
+        result = subprocess.run(command, capture_output=True, text=True, timeout=TIMEOUT, cwd=folder,
+                                stdin=subprocess.DEVNULL, env={**os.environ, 'AUTOMODE_DISABLE': '1'})
+    if result.returncode != 0:
+        raise RuntimeError(f'agy exited {result.returncode}: {result.stderr[-300:]}')
+    return result.stdout
+
+
 def classify(prompt):
     """Returns (allowed, reason)."""
-    if re.match(r'\s*ALLOW\b', claude(FAST, prompt)):
+    ask = agy if BACKEND == 'agy' else claude
+    if re.fullmatch(r'[\s*_`.]*ALLOW[\s*_`.]*', ask(FAST, prompt)):  # Gemini may wrap it in markdown
         return True, ''
-    envelope = json.loads(claude(REASONED, prompt, SCHEMA))
+    envelope = json.loads(ask(REASONED, prompt, SCHEMA))
     verdict = envelope.get('structured_output') or json.loads(envelope.get('result') or '{}')
     return verdict.get('decision') == 'allow', verdict.get('reason') or 'no reason given'
 

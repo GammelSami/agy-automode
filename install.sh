@@ -21,7 +21,7 @@ for profile in "$HOME"/.t3/userdata/providers/antigravity/*/; do
     [ -d "$profile" ] && link "${profile}config/plugins"
 done
 
-command -v claude >/dev/null || echo "warning: claude CLI not found; the classifier falls back to agy's own prompts" >&2
+command -v claude >/dev/null || echo "note: claude CLI not found; the classifier uses Gemini through agy" >&2
 
 if [ "${1:-}" = "--timer" ]; then
     units="$HOME/.config/systemd/user"

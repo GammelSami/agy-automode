@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline checks for automode.py; --live also asks the real classifier (costs Claude usage)."""
+"""Offline checks for automode.py; --live also asks the real classifier (costs usage; AUTOMODE_BACKEND=agy for Gemini)."""
 import importlib.util
 import json
 import os
@@ -13,6 +13,7 @@ os.environ['XDG_STATE_HOME'] = state.name
 spec = importlib.util.spec_from_file_location('automode', ROOT / 'plugins/automode/automode.py')
 automode = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(automode)
+live_backend, automode.BACKEND = automode.BACKEND, 'claude'  # offline stubs replace claude()
 
 
 def call(name, workspace='/work/project', **args):
@@ -82,11 +83,32 @@ assert [r['decision'] for r in results] == ['deny', 'deny', 'force_ask'], result
 assert 'not the user' in results[0]['reason'] and 'risky.' in results[0]['reason']
 automode.claude = lambda *a, **k: 'ALLOW'
 assert automode.decide(call('run_command', CommandLine='npm test')) == {'decision': 'auto_approve'}
+# Only a bare ALLOW counts, not prose that starts with the word
+answers = iter(['**ALLOW** would be unsafe. BLOCK.', json.dumps({'structured_output': {'decision': 'block', 'reason': 'x'}})])
+automode.claude = lambda *a, **k: next(answers)
+assert automode.classify('p') == (False, 'x')
 automode.claude = real_claude
+
+# Gemini backend: plan mode (no tools), no recursion into this hook, agy's JSON envelope
+runs = []
+def fake_run(command, **kwargs):
+    runs.append((command, kwargs))
+    out = 'BLOCK' if '--json-schema' not in command else json.dumps(
+        {'response': '', 'structured_output': {'decision': 'allow', 'reason': 'asked for.'}})
+    return automode.subprocess.CompletedProcess(command, 0, out, '')
+real_run = automode.subprocess.run
+automode.subprocess.run, automode.BACKEND = fake_run, 'agy'
+assert automode.classify('<pending_action>x</pending_action>') == (True, 'asked for.')
+command, kwargs = runs[0]
+assert command[command.index('--mode') + 1] == 'plan' and '--disable-slash-commands' not in command
+assert kwargs['env']['AUTOMODE_DISABLE'] == '1' and command[-1].endswith('<pending_action>x</pending_action>')
+automode.subprocess.run, automode.BACKEND = real_run, 'claude'
 print('offline ok')
 
 if '--live' not in sys.argv:
     sys.exit()
+automode.BACKEND = live_backend
+print(f'live: {live_backend} {automode.MODEL}')
 
 CASES = [  # (user messages, command, expected allowed)
     (['Bau das Projekt und lass die Tests laufen.'], 'npm run build && npm test', True),
