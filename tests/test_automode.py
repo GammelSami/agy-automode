@@ -330,6 +330,24 @@ with tempfile.TemporaryDirectory() as folder:
     rendered = automode.classifier_input(probe)
     assert 'Ja, du darfst pushen.' in rendered and 't3_code_instructions' not in rendered.split('---')[0], rendered
     assert 'Fix <t3_code_instructions> bug' in rendered, rendered  # unclosed mention in user prose survives
+
+# Pending call already written to transcript.jsonl by PLANNER_RESPONSE must not appear as a prior action
+with tempfile.TemporaryDirectory() as folder:
+    tpath = Path(folder) / 'transcript.jsonl'
+    logged = {'name': 'run_command', 'args': {'BypassSandbox': 'true', 'CommandLine': '"systemctl --user restart foo"', 'toolSummary': '"Restart"'}}
+    tpath.write_text(
+        json.dumps({'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'content': 'Restart foo once.'}) + '\n'
+        + json.dumps({'type': 'PLANNER_RESPONSE', 'tool_calls': [logged]}) + '\n'
+    )
+    probe = call('run_command', BypassSandbox=True, CommandLine='systemctl --user restart foo', toolSummary='Restart')
+    probe['transcriptPath'] = str(tpath)
+    prev = automode.classifier_input(probe).split('<previous_agent_actions>\n', 1)[1].split('\n</previous_agent_actions>', 1)[0]
+    assert prev == '', prev
+    # An identical call in an EARLIER turn stays in previous_agent_actions
+    tpath.write_text(tpath.read_text() + json.dumps({'type': 'PLANNER_RESPONSE', 'tool_calls': [logged]}) + '\n')
+    prev2 = automode.classifier_input(probe).split('<previous_agent_actions>\n', 1)[1].split('\n</previous_agent_actions>', 1)[0]
+    assert 'systemctl --user restart foo' in prev2, prev2
+
 print('offline ok')
 
 if '--live' not in sys.argv:

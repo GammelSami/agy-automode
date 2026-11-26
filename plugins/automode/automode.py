@@ -356,8 +356,17 @@ def clean_user_message(text):
     return text.strip()
 
 
+def same_call(logged, pending):
+    """True when a transcript tool_call entry is the same call as pending (agy logs arg values JSON-encoded)."""
+    if logged.get('name') != pending.get('name'):
+        return False
+    a = {k: v for k, v in (logged.get('args') or {}).items() if k not in PROSE_ARGS}
+    raw = {k: v for k, v in (pending.get('args') or {}).items() if k not in PROSE_ARGS}
+    return a == raw or a == {k: json.dumps(v, ensure_ascii=False) for k, v in raw.items()}
+
+
 def classifier_input(data):
-    users, actions = [], []
+    users, actions, last_batch = [], [], 0
     transcript = Path(data.get('transcriptPath', ''))
     full_lines = None
     try:
@@ -377,7 +386,10 @@ def classifier_input(data):
                         except ValueError:
                             pass
                 users.append(clean_user_message(step.get('content') or ''))
-            actions += [call for call in step.get('tool_calls') or [] if call.get('name')]
+            batch = [call for call in step.get('tool_calls') or [] if call.get('name')]
+            if batch:
+                last_batch = len(actions)
+                actions += batch
     except OSError:
         pass
     if not users and data.get('lastUserInput'):
@@ -393,6 +405,11 @@ def classifier_input(data):
     if users:
         picked.insert(0, clip(users[0], 4000))
     pending = data.get('toolCall') or {}
+    # agy writes PLANNER_RESPONSE (with the pending call) to transcript.jsonl before running PreToolUse.
+    for idx in range(len(actions) - 1, last_batch - 1, -1):
+        if same_call(actions[idx], pending):
+            actions.pop(idx)
+            break
     history = [action(call, 600) for call in actions[-25:]]
     return '\n\n'.join([
         '<user_messages>\n' + '\n---\n'.join(picked) + '\n</user_messages>',
