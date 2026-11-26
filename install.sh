@@ -7,9 +7,13 @@ REPO=$(cd "$(dirname "$0")" && pwd)
 PLUGIN="$REPO/plugins/automode"
 
 link() {
-    mkdir -p "$1"
+    # Called as a condition, so set -e is off in here: every step checks its own result.
+    mkdir -p "$1" || return 1
     if [ -L "$1/automode" ] || [ ! -e "$1/automode" ]; then
-        ln -sfn "$PLUGIN" "$1/automode"
+        ln -sfn "$PLUGIN" "$1/automode" && [ -f "$1/automode/hooks.json" ] || {
+            echo "failed to link $1/automode (command(*) not granted there)" >&2
+            return 1
+        }
         echo "linked $1/automode"
     else
         echo "skipped $1/automode: exists and is not a link (command(*) not granted there)" >&2

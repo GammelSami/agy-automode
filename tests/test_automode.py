@@ -372,6 +372,15 @@ with tempfile.TemporaryDirectory() as folder:
         + json.dumps({'type': 'GENERIC', 'content': 'ok'}) + '\n')
     prev4 = automode.classifier_input(probe).split('<previous_agent_actions>\n', 1)[1].split('\n</previous_agent_actions>', 1)[0]
     assert 'first.txt' in prev4 and 'later.txt' not in prev4 and 'systemctl' not in prev4, prev4
+    # Two identical calls in one batch: before the first runs, neither is an earlier action; before the second, one is
+    tpath.write_text(
+        json.dumps({'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'content': 'Restart foo twice.'}) + '\n'
+        + json.dumps({'type': 'PLANNER_RESPONSE', 'tool_calls': [logged, logged]}) + '\n')
+    prev5 = automode.classifier_input(probe).split('<previous_agent_actions>\n', 1)[1].split('\n</previous_agent_actions>', 1)[0]
+    assert prev5 == '', prev5
+    tpath.write_text(tpath.read_text() + json.dumps({'type': 'GENERIC', 'content': 'ok'}) + '\n')
+    prev6 = automode.classifier_input(probe).split('<previous_agent_actions>\n', 1)[1].split('\n</previous_agent_actions>', 1)[0]
+    assert prev6.count('systemctl --user restart foo') == 1, prev6
 
 # An unreadable transcript_full.jsonl must not drop later user messages (e.g. a revoked approval)
 with tempfile.TemporaryDirectory() as folder:

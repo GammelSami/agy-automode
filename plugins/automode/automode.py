@@ -416,8 +416,9 @@ def classifier_input(data):
     # pending call so neither it nor the batch's later, not yet run calls look like earlier actions.
     # Finished batches stay complete, so a repeat of an executed call is never hidden.
     if open_batch and open_batch[2] < open_batch[1]:
-        start, count, _ = open_batch
-        for idx in range(start + count - 1, start - 1, -1):
+        start, count, done = open_batch
+        # The call at start + done is next to run; fall back to earlier slots if a non-result step was counted.
+        for idx in [*range(start + done, start + count), *range(start + done - 1, start - 1, -1)]:
             if same_call(actions[idx], pending):
                 del actions[idx:]
                 break
