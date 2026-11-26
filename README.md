@@ -4,7 +4,7 @@ Antigravity's "Auto" mode is dumb — it keeps nagging you for every `ssh`, pipe
 
 ### How the loop works
 
-1. **Fast skip:** Reads, workspace edits, and simple read-only commands skip Claude.
+1. **Whitelist:** Reads, workspace edits, and simple read-only commands pass immediately without Claude.
 2. **Stage 1 (~2 s):** Claude checks your messages + the tool call → `ALLOW` or escalate.
 3. **Stage 2 (~6 s):** Double-checks flagged calls → `ALLOW`, or deny with a reason so the agent can ask you.
 4. **Human fallback:** After 3 denials in a row (or 20 total), `agy` asks you directly.
