@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Offline checks for automode.py; --live also asks the real classifier (costs usage; AUTOMODE_BACKEND=agy for Gemini)."""
+"""Offline checks for automode.py; --live also asks the real classifier (costs usage; AUTOMODE_BACKEND=claude for Claude CLI)."""
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -79,6 +80,11 @@ with tempfile.TemporaryDirectory() as app:
     os.utime(log, (1, 1))
     assert automode.session_mode(data) == 'auto'
 
+# T3 Code prepends long <t3_code_instructions> after restarts; stripping it keeps <user_request> inside clip()
+wrapped = '<t3_code_instructions>' + ('x' * 5000) + '</t3_code_instructions>\n\n<user_request>push now</user_request><runtime_info>r</runtime_info>'
+assert automode.user_text(wrapped) == '<user_request>push now</user_request>'
+assert automode.user_text('plain message') == 'plain message'
+
 # Outside Auto, or when the classifier fails, the hook has no opinion
 os.environ.pop('AUTOMODE_SESSION_MODE', None)
 assert automode.decide(call('run_command', CommandLine='rm -rf build')) is None
@@ -112,20 +118,142 @@ for first, second in [('**ALLOW** would be unsafe. BLOCK.', ''), ('BLOCK', 'Bloc
         pass
 automode.claude = real_claude
 
-# Gemini backend: plan mode (no tools), no recursion into this hook, agy's JSON envelope
-runs = []
-def fake_run(command, **kwargs):
-    runs.append((command, kwargs))
-    out = 'BLOCK' if '--json-schema' not in command else json.dumps(
-        {'response': '', 'structured_output': {'decision': 'allow', 'reason': 'asked for.'}})
-    return automode.subprocess.CompletedProcess(command, 0, out, '')
-real_run = automode.subprocess.run
-automode.subprocess.run, automode.BACKEND = fake_run, 'agy'
+# agy backend: single stream-json process (plan mode, stdin instead of argv, no recursion, history cleaned up)
+runs, fake_home, saved_home = [], tempfile.TemporaryDirectory(), os.environ.get('HOME')
+os.environ['HOME'] = fake_home.name
+cid = '11111111-2222-3333-4444-555555555555'
+cli_dir = Path(fake_home.name) / '.gemini/antigravity-cli'
+(cli_dir / 'conversations').mkdir(parents=True)
+(cli_dir / 'brain' / cid).mkdir(parents=True)
+(cli_dir / 'conversations' / f'{cid}.db').write_text('')
+
+class FakePopen:
+    def __init__(self, command, **kwargs):
+        runs.append((command, kwargs, self))
+        self.sent = []
+        self._replies = iter([
+            [json.dumps({'event': 'init', 'conversation_id': cid}) + '\n',
+             json.dumps({'event': 'result', 'result': {'conversation_id': cid, 'status': 'SUCCESS', 'response': 'BLOCK\n'}}) + '\n'],
+            [json.dumps({'event': 'result', 'result': {'conversation_id': cid, 'status': 'SUCCESS',
+                                                      'response': '{"decision": "allow", "reason": "asked for."}\n'}}) + '\n'],
+        ])
+        self._queue = []
+        self.stdin = self
+        self.stdout = self
+        self.stderr = io.StringIO('')
+
+    def write(self, data):
+        self.sent.append(json.loads(data))
+        self._queue.extend(next(self._replies))
+
+    def flush(self): pass
+    def close(self): pass
+    def wait(self, timeout=None): return 0
+    def poll(self): return 0
+    def kill(self): pass
+    def __iter__(self): return self
+    def __next__(self):
+        if not self._queue:
+            raise StopIteration
+        return self._queue.pop(0)
+
+real_popen = automode.subprocess.Popen
+automode.subprocess.Popen, automode.BACKEND = FakePopen, 'agy'
 assert automode.classify('<pending_action>x</pending_action>') == (True, 'asked for.')
-command, kwargs = runs[0]
+assert len(runs) == 1  # both stages in one process
+command, kwargs, proc = runs[0]
 assert command[command.index('--mode') + 1] == 'plan' and '--disable-slash-commands' not in command
-assert kwargs['env']['AUTOMODE_DISABLE'] == '1' and '<pending_action>x</pending_action>\n\n## Your task now' in command[-1]
-automode.subprocess.run, automode.BACKEND = real_run, 'claude'
+assert command[command.index('--input-format') + 1] == 'stream-json' and command[command.index('--output-format') + 1] == 'stream-json'
+assert kwargs['env']['AUTOMODE_DISABLE'] == '1' and '<pending_action>' not in ' '.join(command)
+assert len(proc.sent) == 2 and proc.sent[0]['event'] == 'user' and '<pending_action>x</pending_action>' in proc.sent[0]['message']['content']
+assert 'careful second pass' in proc.sent[1]['message']['content']
+assert not (cli_dir / 'conversations' / f'{cid}.db').exists() and not (cli_dir / 'brain' / cid).exists()
+automode.subprocess.Popen = real_popen
+
+# Real child processes: heavy stderr does not deadlock, early stdout EOF does not hang on stderr, default_backend checks dir
+real_find, real_timeout = automode.find, automode.TIMEOUT
+script_heavy = Path(fake_home.name) / 'fake_agy_heavy.py'
+script_heavy.write_text(
+    '#!/usr/bin/env python3\nimport json, sys\n'
+    'sys.stdin.readline()\n'
+    'sys.stderr.write("x" * (256 * 1024)); sys.stderr.flush()\n'
+    'print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "ALLOW"}}), flush=True)\n'
+)
+script_heavy.chmod(0o755)
+automode.find = lambda name: str(script_heavy) if name == 'agy' else real_find(name)
+assert automode.classify('<pending_action>x</pending_action>') == (True, '')
+
+script_eof = Path(fake_home.name) / 'fake_agy_eof.py'
+script_eof.write_text(
+    '#!/usr/bin/env python3\nimport json, os, sys, time\n'
+    'sys.stdin.readline()\n'
+    'print(json.dumps({"event": "init", "conversation_id": "' + cid + '"}), flush=True)\n'
+    'sys.stderr.write("boom\\n"); sys.stderr.flush()\n'
+    'os.close(1)\n'
+    'time.sleep(10)\n'
+)
+script_eof.chmod(0o755)
+(cli_dir / 'conversations' / f'{cid}.db').write_text('')
+automode.find = lambda name: str(script_eof) if name == 'agy' else real_find(name)
+automode.TIMEOUT = 1
+started = automode.time.monotonic()
+try:
+    automode.classify('<pending_action>x</pending_action>')
+    raise AssertionError('expected RuntimeError on stdout EOF')
+except RuntimeError as err:
+    assert 'boom' in str(err)
+assert automode.time.monotonic() - started < 2 and not (cli_dir / 'conversations' / f'{cid}.db').exists()
+
+script_rc = Path(fake_home.name) / 'fake_agy_rc.py'
+script_rc.write_text(
+    '#!/usr/bin/env python3\nimport json, sys\n'
+    'sys.stdin.readline()\n'
+    'print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "ALLOW"}}), flush=True)\n'
+    'sys.exit(7)\n'
+)
+script_rc.chmod(0o755)
+automode.find = lambda name: str(script_rc) if name == 'agy' else real_find(name)
+try:
+    automode.classify('<pending_action>x</pending_action>')
+    raise AssertionError('expected RuntimeError on non-zero exit')
+except RuntimeError as err:
+    assert 'exited 7' in str(err)
+
+script_late = Path(fake_home.name) / 'fake_agy_late.py'
+script_late.write_text(
+    '#!/usr/bin/env python3\nimport json, sys, time\n'
+    'sys.stdin.readline()\n'
+    'time.sleep(0.25)\n'
+    'print(json.dumps({"event": "result", "result": {"status": "SUCCESS", "response": "ALLOW"}}), flush=True)\n'
+)
+script_late.chmod(0o755)
+automode.find = lambda name: str(script_late) if name == 'agy' else real_find(name)
+automode.TIMEOUT = 0.05
+try:
+    automode.classify('<pending_action>x</pending_action>')
+    raise AssertionError('expected TimeoutError on late ALLOW')
+except TimeoutError:
+    pass
+automode.TIMEOUT = real_timeout
+
+# default_backend: requires a directory (not a regular file) for ~/.gemini/antigravity-cli
+automode.find = lambda name: f'/bin/{name}'
+assert automode.default_backend() == 'agy'
+with tempfile.TemporaryDirectory() as other_home:
+    os.environ['HOME'] = other_home
+    assert automode.default_backend() == 'claude'
+    (Path(other_home) / '.gemini').mkdir()
+    (Path(other_home) / '.gemini/antigravity-cli').write_text('not a dir')
+    assert automode.default_backend() == 'claude'
+    automode.find = lambda name: '/bin/agy' if name == 'agy' else None
+    assert automode.default_backend() == 'agy'
+automode.find, automode.BACKEND = real_find, 'claude'
+if saved_home is not None:
+    os.environ['HOME'] = saved_home
+else:
+    os.environ.pop('HOME', None)
+
+real_run = automode.subprocess.run
 
 # Claude backend: stage 2 resumes stage 1's session (cache hit), own entrypoint, transcript removed afterwards
 runs, config, saved_config = [], tempfile.TemporaryDirectory(), os.environ.get('CLAUDE_CONFIG_DIR')

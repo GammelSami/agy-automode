@@ -3,11 +3,13 @@
 
 Only acts while the agy session runs in its Auto mode (T3 Code's "Auto"). Safe tools and
 edits inside the workspace pass untouched; everything else goes to a transcript classifier
-running on Claude (`claude -p`), modelled on https://www.anthropic.com/engineering/claude-code-auto-mode
-and the structure of Claude Code's own rules (`claude auto-mode defaults`), condensed and reworded:
+modelled on https://www.anthropic.com/engineering/claude-code-auto-mode and the structure of
+Claude Code's own rules (`claude auto-mode defaults`), condensed and reworded:
 it sees only the user's messages and the agent's tool calls, never tool output or the agent's
 own prose. A fast one-word pass decides; only a BLOCK gets a second, reasoned pass.
-Without Claude, the classifier runs on Gemini through `agy -p` instead (AUTOMODE_BACKEND=agy).
+By default the classifier runs Claude Sonnet 5.5 through `agy` itself (using your Antigravity
+quota in one persistent `stream-json` process), or through an external `claude -p` CLI
+(`AUTOMODE_BACKEND=claude`).
 
 Printing nothing means "no opinion": agy then applies its normal policy (and T3 asks the human).
 Every failure ends that way, so a broken classifier never approves anything.
@@ -21,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 
@@ -30,8 +33,14 @@ def find(name):
     return shutil.which(name) or (str(fallback) if fallback.exists() else None)
 
 
-BACKEND = os.environ.get('AUTOMODE_BACKEND') or ('claude' if find('claude') else 'agy')
-MODEL = os.environ.get('AUTOMODE_MODEL') or {'claude': 'sonnet', 'agy': 'gemini-4-neon-low'}.get(BACKEND, '')
+def default_backend():
+    if find('agy') and (Path.home() / '.gemini/antigravity-cli').is_dir():
+        return 'agy'
+    return 'claude' if find('claude') else 'agy'
+
+
+BACKEND = os.environ.get('AUTOMODE_BACKEND') or default_backend()
+MODEL = os.environ.get('AUTOMODE_MODEL') or {'agy': 'claude-sonnet-5-5-low', 'claude': 'sonnet'}.get(BACKEND, '')
 STATE = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'agy-automode'
 MAX_CONSECUTIVE_DENIALS, MAX_TOTAL_DENIALS = 3, 20
 TIMEOUT = 40
@@ -238,8 +247,6 @@ main"), since a bare "yes" is not enough. For a HARD rule, say that consent in c
 unverifiable deletion, say to rerun with the literal path. Never repeat secret values. For an allow, one short \
 sentence on why it is fine.
 Reply with only a JSON object: {"decision": "allow" or "block", "reason": "..."}"""
-SCHEMA = {'type': 'object', 'required': ['decision', 'reason'], 'additionalProperties': False,
-          'properties': {'decision': {'enum': ['allow', 'block']}, 'reason': {'type': 'string'}}}
 
 
 def session_mode(data):
@@ -335,6 +342,12 @@ def action(call, limit):
     return clip({'tool': call.get('name'), 'args': args}, limit)
 
 
+def user_text(message):
+    """Strip T3 Code's boilerplate wrappers so clip() never drops the actual <user_request>."""
+    message = re.sub(r'^\s*<t3_code_instructions>.*?</t3_code_instructions>\s*', '', message, flags=re.S)
+    return re.sub(r'\s*<runtime_info>.*?</runtime_info>\s*$', '', message, flags=re.S)
+
+
 def classifier_input(data):
     users, actions = [], []
     try:
@@ -344,12 +357,12 @@ def classifier_input(data):
             except ValueError:
                 continue
             if step.get('source') == 'USER_EXPLICIT' and step.get('type') == 'USER_INPUT':
-                users.append(step.get('content') or '')
+                users.append(user_text(step.get('content') or ''))
             actions += [call for call in step.get('tool_calls') or [] if call.get('name')]
     except OSError:
         pass
     if not users and data.get('lastUserInput'):
-        users = [data['lastUserInput']]
+        users = [user_text(data['lastUserInput'])]
     # Keep the first message (it usually states the task) and as many recent ones as fit.
     picked, budget = [], 24000
     for message in reversed(users[1:]):
@@ -393,22 +406,98 @@ def forget(session):
         transcript.unlink(missing_ok=True)
 
 
-def agy(system, prompt, schema=None):
-    """Gemini via a headless agy turn. agy has no system prompt flag and ignores stdin, so both go
-    into the prompt argument. Plan mode keeps the classifier from running tools (default print mode
-    runs commands), so slash commands must stay enabled: agy ignores --mode plan without them."""
+def forget_agy(conversation):
+    if not conversation or not re.fullmatch(r'[0-9a-f-]{36}', conversation):
+        return
+    cli = Path.home() / '.gemini/antigravity-cli'
+    (cli / 'conversations' / f'{conversation}.db').unlink(missing_ok=True)
+    shutil.rmtree(cli / 'brain' / conversation, ignore_errors=True)
+
+
+def classify_agy(prompt):
+    """One persistent stream-json agy process for stage 1 (+ stage 2 on BLOCK, reusing the prompt cache).
+    Plan mode keeps the classifier from running tools, so slash commands stay enabled (agy ignores
+    --mode plan without them). Prompts go over stdin instead of argv, stderr goes to a temp file so
+    it can neither fill a pipe nor hang on EOF, and the throwaway conversation is deleted afterwards."""
     binary = find('agy') or 'agy'
+    conversation = ''
     with tempfile.TemporaryDirectory(prefix='agy-automode-') as folder:
-        command = [binary, '--model', MODEL, '--mode', 'plan', '--sandbox', '--log-file', f'{folder}/agy.log',
-                   '-p', system + '\n\n' + prompt]
-        if schema:
-            command[-2:-2] = ['--output-format', 'json', '--json-schema', json.dumps(schema)]
-        # The child agy loads this plugin too; it must not classify its own turn.
-        result = subprocess.run(command, capture_output=True, text=True, timeout=TIMEOUT, cwd=folder,
-                                stdin=subprocess.DEVNULL, env={**os.environ, 'AUTOMODE_DISABLE': '1'})
-    if result.returncode != 0:
-        raise RuntimeError(f'agy exited {result.returncode}: {result.stderr[-300:]}')
-    return result.stdout
+        stderr_path = Path(folder) / 'stderr.log'
+        command = [binary, '--model', MODEL, '--mode', 'plan', '--sandbox',
+                   '--input-format', 'stream-json', '--output-format', 'stream-json',
+                   '--log-file', f'{folder}/agy.log']
+        with open(stderr_path, 'w') as err_file:
+            # The child agy loads this plugin too; it must not classify its own turn.
+            proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err_file,
+                                    text=True, cwd=folder, env={**os.environ, 'AUTOMODE_DISABLE': '1'})
+
+        def turn(text):
+            nonlocal conversation
+            timed_out = False
+            deadline = time.monotonic() + TIMEOUT
+
+            def abort():
+                nonlocal timed_out
+                timed_out = True
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+
+            timer = threading.Timer(TIMEOUT, abort)
+            timer.start()
+            try:
+                proc.stdin.write(json.dumps({'event': 'user', 'message': {'content': text}}) + '\n')
+                proc.stdin.flush()
+                for line in proc.stdout:
+                    if timed_out or time.monotonic() > deadline:
+                        raise TimeoutError(f'agy timed out after {TIMEOUT}s')
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if event.get('event') == 'init' and event.get('conversation_id'):
+                        conversation = event['conversation_id']
+                    elif event.get('event') == 'result':
+                        res = event.get('result') or {}
+                        conversation = res.get('conversation_id') or conversation
+                        if res.get('status') != 'SUCCESS':
+                            raise RuntimeError(f"agy failed: {res.get('error') or res.get('status')}")
+                        return res.get('response') or ''
+                    elif event.get('event') == 'error':
+                        raise RuntimeError(f'agy error: {str(event)[-300:]}')
+            finally:
+                timer.cancel()
+            if timed_out or time.monotonic() > deadline:
+                raise TimeoutError(f'agy timed out after {TIMEOUT}s')
+            err = stderr_path.read_text(errors='replace')[-300:]
+            raise RuntimeError(f'agy ended without result: {err}')
+
+        try:
+            if first_pass(turn(POLICY + '\n\n' + prompt + FAST)):
+                result = (True, '')
+            else:
+                decision = verdict(turn(REASONED.strip()))
+                result = (decision.get('decision') == 'allow', decision.get('reason') or 'no reason given')
+            proc.stdin.close()
+            if proc.wait(timeout=5) != 0:
+                raise RuntimeError(f"agy exited {proc.returncode}: {stderr_path.read_text(errors='replace')[-300:]}")
+            return result
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
+            if proc.poll() is None:
+                proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+            forget_agy(conversation)
 
 
 def first_pass(answer):
@@ -433,17 +522,14 @@ def verdict(text):
 def classify(prompt):
     """Returns (allowed, reason)."""
     if BACKEND == 'agy':
-        if first_pass(agy(POLICY, prompt + FAST)):
+        return classify_agy(prompt)
+    session = str(uuid.uuid4())
+    try:
+        if first_pass(claude(prompt + FAST, session)):
             return True, ''
-        decision = verdict(agy(POLICY, prompt + REASONED, SCHEMA))
-    else:
-        session = str(uuid.uuid4())
-        try:
-            if first_pass(claude(prompt + FAST, session)):
-                return True, ''
-            decision = verdict(claude(REASONED.strip(), session, resume=True))
-        finally:
-            forget(session)
+        decision = verdict(claude(REASONED.strip(), session, resume=True))
+    finally:
+        forget(session)
     return decision.get('decision') == 'allow', decision.get('reason') or 'no reason given'
 
 
