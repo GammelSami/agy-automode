@@ -4,10 +4,10 @@ Antigravity's "Auto" mode is dumb — it keeps nagging you for every `ssh`, pipe
 
 ### How the loop works
 
-1. **Fast skip (no LLM):** A built-in safe list (reads, search, workspace edits, T3 tools, simple read-only commands like `ls` or `git status`) skips Claude and goes straight to `agy`.
-2. **Stage 1 (quick check, ~2 s):** Claude (`claude -p`, Sonnet by default) sees only **your messages and tool calls** — `ALLOW` runs immediately, `BLOCK` goes to stage 2.
-3. **Stage 2 (reasoned check, ~6 s):** Double-checks flagged actions — either `ALLOW`, or denies it back to the agent as "automatic check, not the user" so it explains what it wants to run and lets you reply `"yes, you may run …"`.
-4. **Human fallback:** After **3 denials in a row** or **20 in a conversation**, it stops deciding and asks you (`force_ask`).
+1. **Fast skip:** Reads, workspace edits, and simple read-only commands skip Claude.
+2. **Stage 1 (~2 s):** Claude checks your messages + the tool call → `ALLOW` or escalate.
+3. **Stage 2 (~6 s):** Double-checks flagged calls → `ALLOW`, or deny with a reason so the agent can ask you.
+4. **Human fallback:** After 3 denials in a row (or 20 total), `agy` asks you directly.
 
 ## How it compares
 
