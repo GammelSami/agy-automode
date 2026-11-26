@@ -279,6 +279,8 @@ def decide(data):
     mode = os.environ.get('AUTOMODE_SESSION_MODE') or session_mode(data)
     if mode != 'auto' or not needs_classifier(data):
         return None
+    if len(action(data.get('toolCall') or {}, 10**6)) > 6000:
+        return None  # the classifier would only see a clipped action: let the human look at it
     started = time.time()
     allowed, reason = classify(classifier_input(data))
     counts = denials(data.get('conversationId', ''), allowed)

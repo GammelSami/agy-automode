@@ -33,10 +33,10 @@ Needs Python 3 and a signed-in [Claude Code](https://code.claude.com) CLI. No Cl
 
 ```sh
 git clone https://github.com/GammelSami/agy-automode ~/Git/agy-automode
-~/Git/agy-automode/install.sh --timer
+~/Git/agy-automode/install.sh
 ```
 
-`install.sh` links the plugin into `~/.gemini/config/plugins` (terminal `agy`) and into every T3 Code Antigravity profile, so `git pull` updates all of them. `--timer` adds a daily systemd user timer for that pull. New agy sessions pick the plugin up; running ones don't.
+`install.sh` links the plugin into `~/.gemini/config/plugins` (terminal `agy`) and into every T3 Code Antigravity profile, so `git pull` updates all of them. `--timer` adds a daily systemd user timer for that pull: only use it if you trust every future commit here, because the pulled code runs as a hook with your rights. New agy sessions pick the plugin up; running ones don't.
 
 For unattended use, give the classifier a long-lived Claude token (`claude setup-token`), because an interactive sign-in can expire.
 
@@ -56,7 +56,7 @@ Decisions are logged to `~/.local/state/agy-automode/decisions.jsonl`.
 - agy's hook input doesn't say which mode a session runs in. The plugin reads it from agy's own log (`Session <id> mode set to …` and the mode tag of the conversation's latest turn). If an agy update changes those lines, the plugin goes quiet instead of guessing.
 - Approving a command doesn't take it out of agy's sandbox. A command that the sandbox blocks still fails.
 - Classifying costs Claude or Antigravity usage: about one short request per command that isn't plainly read-only.
-- With Gemini, each check takes ~6 s instead of ~2 s (a whole headless `agy` turn), and it shows up as a conversation in agy's history.
+- With Gemini, each check takes ~6 s instead of ~2 s (a whole headless `agy` turn), and it shows up as a conversation in agy's history. The prompt goes to `agy` as a command-line argument, so other local users may see it in the process list while it runs.
 
 ## Tests
 

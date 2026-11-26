@@ -83,6 +83,7 @@ assert [r['decision'] for r in results] == ['deny', 'deny', 'force_ask'], result
 assert 'not the user' in results[0]['reason'] and 'risky.' in results[0]['reason']
 automode.claude = lambda *a, **k: 'ALLOW'
 assert automode.decide(call('run_command', CommandLine='npm test')) == {'decision': 'auto_approve'}
+assert automode.decide(call('run_command', CommandLine='echo ' + 'x' * 7000)) is None  # too long to show in full
 # Only a bare ALLOW counts, not prose that starts with the word
 answers = iter(['**ALLOW** would be unsafe. BLOCK.', json.dumps({'structured_output': {'decision': 'block', 'reason': 'x'}})])
 automode.claude = lambda *a, **k: next(answers)
