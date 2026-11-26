@@ -6,7 +6,7 @@
 
 1. **Whitelist:** common read-only commands and workspace edits pass immediately (without LLM), except reads of credential paths (`~/.ssh`, `.env`, …) and edits of agent config (`.gemini`, `AGENTS.md`, `.git`, …).
 2. **Stage 1 (~2 s):** LLM checks only your messages + the tool call → `ALLOW` or escalate.
-3. **Stage 2 (~6 s):** Double-checks flagged calls (with thinking) → `ALLOW`, or deny with the rule name and what you would have to say to allow it.
+3. **Stage 2 (~3 s):** Continues the same classifier session (cached prompt) to double-check flagged calls with reasoning → `ALLOW`, or deny with the rule name and what you would have to say to allow it.
 4. **Human fallback:** After 3 denials in a row (or 20 total), `agy` asks you directly.
 
 ## How it compares
@@ -55,7 +55,7 @@ Decisions are logged to `~/.local/state/agy-automode/decisions.jsonl`.
 
 - agy's hook input doesn't say which mode a session runs in. The plugin reads it from agy's own log (`Session <id> mode set to …` and the mode tag of the conversation's latest turn). If an agy update changes those lines, the plugin goes quiet instead of guessing.
 - Approving a command doesn't take it out of agy's sandbox. A command that the sandbox blocks still fails.
-- Classifying costs Claude or Antigravity usage: about one short request per command that isn't plainly read-only.
+- Classifying costs Claude or Antigravity usage: about one short request per command that isn't plainly read-only. With Claude it uses the 5-minute prompt cache and reports its own entrypoint `agy-automode`, because plain `claude -p` (`sdk-cli`) counts about 1.8–3x against the 5-hour limit ([anthropics/claude-code#97074](https://github.com/anthropics/claude-code/issues/97074)).
 - With Gemini, each check takes ~6 s instead of ~2 s (a whole headless `agy` turn), and it shows up as a conversation in agy's history. The prompt goes to `agy` as a command-line argument, so other local users may see it in the process list while it runs.
 
 ## Tests

@@ -118,8 +118,27 @@ automode.subprocess.run, automode.BACKEND = fake_run, 'agy'
 assert automode.classify('<pending_action>x</pending_action>') == (True, 'asked for.')
 command, kwargs = runs[0]
 assert command[command.index('--mode') + 1] == 'plan' and '--disable-slash-commands' not in command
-assert kwargs['env']['AUTOMODE_DISABLE'] == '1' and command[-1].endswith('<pending_action>x</pending_action>')
+assert kwargs['env']['AUTOMODE_DISABLE'] == '1' and '<pending_action>x</pending_action>\n\n## Your task now' in command[-1]
 automode.subprocess.run, automode.BACKEND = real_run, 'claude'
+
+# Claude backend: stage 2 resumes stage 1's session (cache hit), own entrypoint, transcript removed afterwards
+runs, config = [], tempfile.TemporaryDirectory()
+os.environ['CLAUDE_CONFIG_DIR'] = config.name
+def fake_run(command, **kwargs):
+    runs.append((command, kwargs))
+    session = command[-1]
+    (Path(config.name) / 'projects/-tmp').mkdir(parents=True, exist_ok=True)
+    (Path(config.name) / f'projects/-tmp/{session}.jsonl').write_text('{}')
+    return automode.subprocess.CompletedProcess(command, 0, 'BLOCK' if '--session-id' in command else
+                                                '```json\n{"decision": "block", "reason": "[Git Push] no."}\n```', '')
+automode.subprocess.run = fake_run
+assert automode.classify('<pending_action>x</pending_action>') == (False, '[Git Push] no.')
+(first, first_kwargs), (second, _) = runs
+assert first[-2:] == ['--session-id', second[-1]] and second[-2] == '--resume'
+assert first[first.index('--system-prompt') + 1] == second[second.index('--system-prompt') + 1] == automode.POLICY
+assert first_kwargs['env']['CLAUDE_CODE_ENTRYPOINT'] == 'agy-automode' and not list(Path(config.name).rglob('*.jsonl'))
+automode.subprocess.run = real_run
+del os.environ['CLAUDE_CONFIG_DIR']
 print('offline ok')
 
 if '--live' not in sys.argv:
