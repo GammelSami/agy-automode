@@ -411,25 +411,35 @@ def agy(system, prompt, schema=None):
     return result.stdout
 
 
+def first_pass(answer):
+    """True for ALLOW, False for BLOCK. Anything else raises: stage 2 must not continue from an odd answer."""
+    match = re.fullmatch(r'[\s*_`.]*(ALLOW|BLOCK)[\s*_`.]*', answer)  # Gemini may wrap it in markdown
+    if not match:
+        raise ValueError(f'unexpected first-pass answer: {answer[-200:]}')
+    return match.group(1) == 'ALLOW'
+
+
 def verdict(text):
-    """The decision object, bare or inside a CLI's JSON envelope (structured_output, result or response)."""
-    data = json.loads(re.search(r'\{.*\}', text, re.S).group())
+    """The decision object: the whole answer (in at most one code fence), or inside a CLI's JSON envelope."""
+    text = re.sub(r'^\s*```(?:json)?\s*\n(.*)\n\s*```\s*$', r'\1', text, flags=re.S)
+    data = json.loads(text)
     if 'decision' not in data:
         data = data.get('structured_output') or json.loads(data.get('result') or data.get('response') or '{}')
+    if data.get('decision') not in ('allow', 'block') or not isinstance(data.get('reason'), str):
+        raise ValueError(f'malformed verdict: {text[-200:]}')
     return data
 
 
 def classify(prompt):
     """Returns (allowed, reason)."""
-    allow = lambda answer: re.fullmatch(r'[\s*_`.]*ALLOW[\s*_`.]*', answer)  # Gemini may wrap it in markdown
     if BACKEND == 'agy':
-        if allow(agy(POLICY, prompt + FAST)):
+        if first_pass(agy(POLICY, prompt + FAST)):
             return True, ''
         decision = verdict(agy(POLICY, prompt + REASONED, SCHEMA))
     else:
         session = str(uuid.uuid4())
         try:
-            if allow(claude(prompt + FAST, session)):
+            if first_pass(claude(prompt + FAST, session)):
                 return True, ''
             decision = verdict(claude(REASONED.strip(), session, resume=True))
         finally:

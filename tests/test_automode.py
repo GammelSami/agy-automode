@@ -100,10 +100,16 @@ assert 'not the user' in results[0]['reason'] and 'risky.' in results[0]['reason
 automode.claude = lambda *a, **k: 'ALLOW'
 assert automode.decide(call('run_command', CommandLine='npm test')) == {'decision': 'auto_approve'}
 assert automode.decide(call('run_command', CommandLine='echo ' + 'x' * 7000)) is None  # too long to show in full
-# Only a bare ALLOW counts, not prose that starts with the word
-answers = iter(['**ALLOW** would be unsafe. BLOCK.', json.dumps({'structured_output': {'decision': 'block', 'reason': 'x'}})])
-automode.claude = lambda *a, **k: next(answers)
-assert automode.classify('p') == (False, 'x')
+# Only a bare ALLOW or BLOCK counts; prose or a JSON fragment inside prose means no opinion
+for first, second in [('**ALLOW** would be unsafe. BLOCK.', ''), ('BLOCK', 'Blocked. {"decision": "allow", "reason": ""}'),
+                      ('BLOCK', '{"decision": "allow"}')]:
+    answers = iter([first, second])
+    automode.claude = lambda *a, **k: next(answers)
+    try:
+        automode.classify('p')
+        raise AssertionError((first, second))
+    except ValueError:
+        pass
 automode.claude = real_claude
 
 # Gemini backend: plan mode (no tools), no recursion into this hook, agy's JSON envelope
@@ -122,7 +128,7 @@ assert kwargs['env']['AUTOMODE_DISABLE'] == '1' and '<pending_action>x</pending_
 automode.subprocess.run, automode.BACKEND = real_run, 'claude'
 
 # Claude backend: stage 2 resumes stage 1's session (cache hit), own entrypoint, transcript removed afterwards
-runs, config = [], tempfile.TemporaryDirectory()
+runs, config, saved_config = [], tempfile.TemporaryDirectory(), os.environ.get('CLAUDE_CONFIG_DIR')
 os.environ['CLAUDE_CONFIG_DIR'] = config.name
 def fake_run(command, **kwargs):
     runs.append((command, kwargs))
@@ -138,7 +144,9 @@ assert first[-2:] == ['--session-id', second[-1]] and second[-2] == '--resume'
 assert first[first.index('--system-prompt') + 1] == second[second.index('--system-prompt') + 1] == automode.POLICY
 assert first_kwargs['env']['CLAUDE_CODE_ENTRYPOINT'] == 'agy-automode' and not list(Path(config.name).rglob('*.jsonl'))
 automode.subprocess.run = real_run
-del os.environ['CLAUDE_CONFIG_DIR']
+os.environ.pop('CLAUDE_CONFIG_DIR')
+if saved_config is not None:
+    os.environ['CLAUDE_CONFIG_DIR'] = saved_config
 print('offline ok')
 
 if '--live' not in sys.argv:
