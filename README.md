@@ -7,7 +7,7 @@
 1. **Whitelist:** common read-only commands and workspace edits pass immediately (without LLM), except reads of credential paths (`~/.ssh`, `.env`, …) and edits of agent config (`.gemini`, `AGENTS.md`, `.git`, …).
 2. **Stage 1 (~3.7 s):** LLM checks only your messages + the tool call → `ALLOW` or escalate.
 3. **Stage 2 (~2.5 s):** Continues the same classifier session (cached prompt) to double-check flagged calls with reasoning → `ALLOW`, or `deny` with the rule name and what you would have to say to allow it (never hangs unattended runs on interactive prompts).
-4. **No duplicate `agy` prompts:** `install.sh` adds `command(*)` to `agy`'s allow list so `agy`'s built-in reversibility prompt doesn't override this classifier, while keeping the OS sandbox enabled. When `command(*)` is active, `automode.py` fails closed (`deny` on classifier error or oversized commands) and returns `force_ask` outside Auto mode so Supervised still prompts.
+4. **No duplicate `agy` prompts:** `install.sh` adds `command(*)` to `agy`'s allow list so `agy`'s built-in reversibility prompt doesn't override this classifier, while keeping the OS sandbox enabled. When `command(*)` is active, `automode.py` fails closed (`deny` on classifier error or oversized commands) and returns `force_ask` for every shell command outside Auto and Full access, so Supervised still prompts. `install.sh` only grants `command(*)` where it could link the hook.
 
 ## How it compares
 
@@ -23,7 +23,7 @@
 | Scans tool outputs for prompt injection | ✅ | ⚠️ *(undocumented)* | ❌ |
 
 **Safeguards:**
-- **Auto mode only:** Supervised, Auto-accept edits, and Full access stay unchanged (with `command(*)` enabled, the hook returns `force_ask` outside Auto mode so Supervised still prompts).
+- **Auto mode only:** The classifier only runs in Auto. Full access stays unasked; with `command(*)` enabled, Supervised and Auto-accept edits get `force_ask` for every shell command (without it they stay unchanged).
 - **Fail-safe:** Without `command(*)`, any failure (missing `agy`/`claude`, timeout, changed `agy` logs) returns no opinion so `agy` and T3 ask you; with `command(*)` enabled, failures and oversized commands fail closed with `deny`.
 - **Hook precedence:** A `deny` from another hook still wins over this plugin's approval.
 
@@ -53,7 +53,7 @@ Decisions are logged to `~/.local/state/agy-automode/decisions.jsonl`.
 
 ## Limits
 
-- agy's hook input doesn't say which mode a session runs in. The plugin reads it from agy's own log (`Session <id> mode set to …` and the mode tag of the conversation's latest turn). If an agy update changes those lines, the plugin goes quiet instead of guessing.
+- agy's hook input doesn't say which mode a session runs in. The plugin reads it from agy's own log (`Session <id> mode set to …` and the mode tag of the conversation's latest turn). If an agy update changes those lines, the plugin goes quiet instead of guessing (with `command(*)`: asks for every shell command).
 - Approving a command doesn't take it out of agy's sandbox. A command that the sandbox blocks still fails.
 - Classifying costs Antigravity or Claude usage: about one short request per command that isn't plainly read-only.
 - With `agy` (default), Stage 1 + Stage 2 share one headless `stream-json` process (~3.7 s for Stage 1, ~2.5 s extra for Stage 2 with cached prompt), prompts are passed via `stdin`, and the throwaway conversation is deleted afterwards. Terminal `agy` uses `~/.gemini/antigravity-cli`, separate from T3 Code's Antigravity login.

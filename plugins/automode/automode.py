@@ -366,7 +366,8 @@ def same_call(logged, pending):
 
 
 def classifier_input(data):
-    users, actions, last_batch = [], [], 0
+    # open_batch: (start index in actions, call count, steps logged after it) of the latest tool_call batch.
+    users, actions, open_batch = [], [], None
     transcript = Path(data.get('transcriptPath', ''))
     full_lines = None
     try:
@@ -378,8 +379,11 @@ def classifier_input(data):
             if step.get('source') == 'USER_EXPLICIT' and step.get('type') == 'USER_INPUT':
                 if 'content' in (step.get('truncated_fields') or []):
                     if full_lines is None:
-                        full = transcript.with_name('transcript_full.jsonl')
-                        full_lines = full.read_text(errors='replace').splitlines() if full.exists() else []
+                        try:
+                            full_lines = transcript.with_name('transcript_full.jsonl').read_text(
+                                errors='replace').splitlines()
+                        except OSError:  # optional: keep the compact message and the rest of the transcript
+                            full_lines = []
                     if index < len(full_lines):
                         try:
                             step = json.loads(full_lines[index])
@@ -388,8 +392,10 @@ def classifier_input(data):
                 users.append(clean_user_message(step.get('content') or ''))
             batch = [call for call in step.get('tool_calls') or [] if call.get('name')]
             if batch:
-                last_batch = len(actions)
+                open_batch = (len(actions), len(batch), 0)
                 actions += batch
+            elif open_batch:
+                open_batch = (open_batch[0], open_batch[1], open_batch[2] + 1)
     except OSError:
         pass
     if not users and data.get('lastUserInput'):
@@ -405,11 +411,16 @@ def classifier_input(data):
     if users:
         picked.insert(0, clip(users[0], 4000))
     pending = data.get('toolCall') or {}
-    # agy writes PLANNER_RESPONSE (with the pending call) to transcript.jsonl before running PreToolUse.
-    for idx in range(len(actions) - 1, last_batch - 1, -1):
-        if same_call(actions[idx], pending):
-            actions.pop(idx)
-            break
+    # agy logs the PLANNER_RESPONSE holding the pending call before PreToolUse, and each executed call then
+    # gets one result step. While the latest batch still has calls without a result, cut the history at the
+    # pending call so neither it nor the batch's later, not yet run calls look like earlier actions.
+    # Finished batches stay complete, so a repeat of an executed call is never hidden.
+    if open_batch and open_batch[2] < open_batch[1]:
+        start, count, _ = open_batch
+        for idx in range(start + count - 1, start - 1, -1):
+            if same_call(actions[idx], pending):
+                del actions[idx:]
+                break
     history = [action(call, 600) for call in actions[-25:]]
     return '\n\n'.join([
         '<user_messages>\n' + '\n---\n'.join(picked) + '\n</user_messages>',
@@ -572,11 +583,9 @@ def classify(prompt):
 def wildcard_commands(data):
     """True when agy's settings or shared config grant command(*) — then no-opinion would fail open."""
     transcript = data.get('transcriptPath', '')
-    if not transcript:
-        return False
-    parents = Path(transcript).parents
+    parents = Path(transcript).parents if transcript else []
     if len(parents) < 6:
-        return False
+        return True  # profile unknown: cannot rule the grant out, so behave as if it were active
     app_dir = parents[4]  # <gemini_dir>/<app_data_dir>
     checks = [
         (app_dir / 'settings.json', ('permissions', 'allow')),
@@ -612,12 +621,13 @@ def decide(data):
     call = data.get('toolCall') or {}
     wildcard_cmd = call.get('name') == 'run_command' and wildcard_commands(data)
     mode = os.environ.get('AUTOMODE_SESSION_MODE') or session_mode(data)
-    if not needs_classifier(data):
-        return None
     if mode != 'auto':
-        if wildcard_cmd:
+        # command(*) would otherwise run every command unasked; turbo (Full access) wants exactly that.
+        if wildcard_cmd and mode != 'turbo':
             return {'decision': 'force_ask',
                     'reason': 'command(*) allow rule is active; asking outside auto mode.'}
+        return None
+    if not needs_classifier(data):
         return None
     if len(action(call, 10**6)) > 6000:
         if wildcard_cmd:
@@ -651,8 +661,12 @@ def main():
             log(data, 'error', msg, time.time())
         except Exception:
             pass
-        call = data.get('toolCall') or {}
-        if call.get('name') == 'run_command' and wildcard_commands(data) and needs_classifier(data):
+        call = (data.get('toolCall') if isinstance(data, dict) else None) or {}
+        try:
+            fail_closed = call.get('name') == 'run_command' and wildcard_commands(data)
+        except Exception:
+            fail_closed = True
+        if fail_closed:
             print(json.dumps({
                 'decision': 'deny',
                 'reason': f'Blocked by auto mode: classifier failed ({msg}); refusing to fail open with command(*).',

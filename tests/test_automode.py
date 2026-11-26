@@ -17,8 +17,13 @@ spec.loader.exec_module(automode)
 live_backend, automode.BACKEND = automode.BACKEND, 'claude'  # offline stubs replace claude()
 
 
+# A profile without the command(*) grant, so the hook can rule the grant out
+NO_GRANT = tempfile.mkdtemp()
+NO_GRANT_TRANSCRIPT = f'{NO_GRANT}/antigravity-acp/brain/c/.system_generated/logs/transcript.jsonl'
+
+
 def call(name, workspace='/work/project', **args):
-    return {'hookEventName': 'PreToolUse', 'toolCall': {'name': name, 'args': args},
+    return {'hookEventName': 'PreToolUse', 'toolCall': {'name': name, 'args': args}, 'transcriptPath': NO_GRANT_TRANSCRIPT,
             'workspacePaths': [workspace], 'cwd': workspace, 'conversationId': '0' * 8 + '-0000-0000-0000-' + '0' * 12}
 
 
@@ -118,7 +123,9 @@ with tempfile.TemporaryDirectory() as gemini_dir:
     assert automode.wildcard_commands(wcall('systemctl --user restart foo'))
     os.environ.pop('AUTOMODE_SESSION_MODE', None)
     assert automode.decide(wcall('systemctl --user restart foo'))['decision'] == 'force_ask'
-    assert automode.decide(wcall('git status')) is None  # read-only still passes
+    assert automode.decide(wcall('git status'))['decision'] == 'force_ask'  # Supervised asks for every command
+    os.environ['AUTOMODE_SESSION_MODE'] = 'turbo'
+    assert automode.decide(wcall('systemctl --user restart foo')) is None  # Full access stays unasked
     os.environ['AUTOMODE_SESSION_MODE'] = 'auto'
     assert automode.decide(wcall('python3 -c ' + 'x' * 7000))['decision'] == 'deny'
     # main() fails closed with deny when classifier raises while command(*) is active
@@ -139,6 +146,8 @@ with tempfile.TemporaryDirectory() as gemini_dir:
     (Path(gemini_dir) / 'config/config.json').write_text(
         json.dumps({'userSettings': {'globalPermissionGrants': {'allow': ['command(*)']}}}))
     assert automode.wildcard_commands(wcall('rm -rf build'))
+    # Unknown profile (no transcriptPath): the grant cannot be ruled out
+    assert automode.wildcard_commands({k: v for k, v in wcall('rm -rf build').items() if k != 'transcriptPath'})
 
 # Only a bare ALLOW or BLOCK counts; prose or a JSON fragment inside prose means no opinion
 for first, second in [('**ALLOW** would be unsafe. BLOCK.', ''), ('BLOCK', 'Blocked. {"decision": "allow", "reason": ""}'),
@@ -347,6 +356,34 @@ with tempfile.TemporaryDirectory() as folder:
     tpath.write_text(tpath.read_text() + json.dumps({'type': 'PLANNER_RESPONSE', 'tool_calls': [logged]}) + '\n')
     prev2 = automode.classifier_input(probe).split('<previous_agent_actions>\n', 1)[1].split('\n</previous_agent_actions>', 1)[0]
     assert 'systemctl --user restart foo' in prev2, prev2
+    # (B) The latest batch already has its result: an identical executed call is never hidden
+    tpath.write_text(
+        json.dumps({'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'content': 'Restart foo once.'}) + '\n'
+        + json.dumps({'type': 'PLANNER_RESPONSE', 'tool_calls': [logged]}) + '\n'
+        + json.dumps({'type': 'GENERIC', 'content': 'ok'}) + '\n')
+    prev3 = automode.classifier_input(probe).split('<previous_agent_actions>\n', 1)[1].split('\n</previous_agent_actions>', 1)[0]
+    assert 'systemctl --user restart foo' in prev3, prev3
+    # (C) Multi-call batch: calls after the pending one have not run yet; earlier ones have
+    later = {'name': 'read_file', 'args': {'Path': '"/work/later.txt"'}}
+    first = {'name': 'read_file', 'args': {'Path': '"/work/first.txt"'}}
+    tpath.write_text(
+        json.dumps({'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'content': 'Restart foo once.'}) + '\n'
+        + json.dumps({'type': 'PLANNER_RESPONSE', 'tool_calls': [first, logged, later]}) + '\n'
+        + json.dumps({'type': 'GENERIC', 'content': 'ok'}) + '\n')
+    prev4 = automode.classifier_input(probe).split('<previous_agent_actions>\n', 1)[1].split('\n</previous_agent_actions>', 1)[0]
+    assert 'first.txt' in prev4 and 'later.txt' not in prev4 and 'systemctl' not in prev4, prev4
+
+# An unreadable transcript_full.jsonl must not drop later user messages (e.g. a revoked approval)
+with tempfile.TemporaryDirectory() as folder:
+    tpath = Path(folder) / 'transcript.jsonl'
+    tpath.write_text(
+        json.dumps({'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'content': 'Du darfst pushen.'}) + '\n'
+        + json.dumps({'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'content': 'long…', 'truncated_fields': ['content']}) + '\n'
+        + json.dumps({'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'content': 'Nicht mehr pushen!'}) + '\n')
+    (Path(folder) / 'transcript_full.jsonl').mkdir()  # reading a directory raises OSError
+    probe = call('run_command', CommandLine='git push')
+    probe['transcriptPath'] = str(tpath)
+    assert 'Nicht mehr pushen!' in automode.classifier_input(probe)
 
 print('offline ok')
 
