@@ -2,16 +2,30 @@
 
 Claude-style auto mode for [Antigravity](https://antigravity.google) (`agy`), including its sessions in [T3 Code](https://github.com/pingdotgg/t3code).
 
-agy's own Auto mode asks about every command it doesn't know, so in T3 Code's **Auto** you approve `ssh`, pipes and the like over and over. This plugin puts a transcript classifier in front of those prompts, built like [Claude Code's auto mode](https://www.anthropic.com/engineering/claude-code-auto-mode):
+`agy`'s built-in Auto mode prompts on almost every command outside a small fixed list (`ssh`, pipes, MCP tools). This plugin adds a transcript classifier based on the design Anthropic shared in their [Claude Code auto mode blog post](https://www.anthropic.com/engineering/claude-code-auto-mode):
 
-- It only acts while the agy session runs in Auto. Supervised, Auto-accept edits and Full access stay unchanged.
-- Safe tools (reads, search, task list, T3's own MCP tools) and edits inside the workspace pass untouched, as do simple read-only commands such as `git status` or `ls`.
-- Everything else goes to Claude (`claude -p`, Sonnet by default). The classifier sees **only your messages and the agent's tool calls**, never tool output or the agent's own text, so neither a file's content nor the agent can talk it into anything.
-- A fast one-word check approves most actions in about 2 s. Only a BLOCK gets a second, reasoned pass.
-- A block reaches the agent as "automatic check, not the user", with the reason. The agent then tells you what it wants to run. Reply "yes, you may run …" and the next attempt is allowed.
-- After 3 blocks in a row, or 20 in a conversation, you decide instead (`force_ask`).
-- Any failure (no `claude`, timeout, an agy update that changes its logs) means no opinion: agy and T3 ask you as before. The plugin never approves anything on its own.
-- Other hooks keep priority: a `deny` from another hook still wins over this plugin's approval.
+1. **Fast filter (no LLM):** Reads, search, task/T3 tools, workspace edits, and simple read-only commands (`ls`, `git status`, …) pass untouched.
+2. **Stage 1 (quick check, ~2 s):** Claude (`claude -p`, Sonnet by default) sees only **your messages and tool calls** — `ALLOW` runs immediately, `BLOCK` goes to stage 2.
+3. **Stage 2 (reasoned check, ~6 s):** Re-evaluates blocks carefully — either `ALLOW`, or `BLOCK` back to the agent as "automatic check, not the user" so it can explain and let you reply `"yes, you may run …"`.
+4. **Human fallback:** After **3 blocks in a row** or **20 in a conversation**, you decide (`force_ask`).
+
+## How it compares
+
+| Behavior | Claude Auto | `agy` built-in Auto | `agy` + `agy-automode` |
+|---|---|---|---|
+| Reads & workspace edits without prompts | ✅ | ✅ | ✅ |
+| Judges commands from your messages | ✅ *(Sonnet 5 / server)* | ❌ *(fixed command list)* | ✅ *(Claude Sonnet)* |
+| Blind to agent prose & tool outputs | ✅ | ❌ *(sees full trajectory)* | ✅ |
+| Two-stage check (fast → reasoned) | ✅ | ✅ | ✅ *(~2 s → ~6 s)* |
+| Approves safe MCP & unknown commands | ✅ | ❌ *(prompts by default)* | ⚠️ *(yes, stays in sandbox)* |
+| On block: reason to agent instead of popup | ✅ | ❌ *(popup or turn abort)* | ✅ |
+| Escalates only after 3 in a row / 20 total | ✅ | ❌ *(prompts immediately)* | ✅ |
+| Scans tool outputs for prompt injection | ✅ | ⚠️ *(undocumented)* | ❌ |
+
+**Safeguards:**
+- **Auto mode only:** Supervised, Auto-accept edits, and Full access stay unchanged.
+- **Fail-safe:** Any failure (missing `claude`, timeout, changed `agy` logs) returns no opinion, so `agy` and T3 ask you as before.
+- **Hook precedence:** A `deny` from another hook still wins over this plugin's approval.
 
 ## Install
 
