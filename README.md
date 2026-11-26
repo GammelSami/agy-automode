@@ -6,8 +6,8 @@
 
 1. **Whitelist:** common read-only commands and workspace edits pass immediately (without LLM), except reads of credential paths (`~/.ssh`, `.env`, …) and edits of agent config (`.gemini`, `AGENTS.md`, `.git`, …).
 2. **Stage 1 (~3.7 s):** LLM checks only your messages + the tool call → `ALLOW` or escalate.
-3. **Stage 2 (~2.5 s):** Continues the same classifier session (cached prompt) to double-check flagged calls with reasoning → `ALLOW`, or deny with the rule name and what you would have to say to allow it.
-4. **Human fallback:** After 3 denials in a row (or 20 total), `agy` asks you directly.
+3. **Stage 2 (~2.5 s):** Continues the same classifier session (cached prompt) to double-check flagged calls with reasoning → `ALLOW`, or `deny` with the rule name and what you would have to say to allow it (never hangs unattended runs on interactive prompts).
+4. **No duplicate `agy` prompts:** `install.sh` adds `command(*)` to `agy`'s allow list so `agy`'s built-in reversibility prompt doesn't override this classifier, while keeping the OS sandbox enabled. When `command(*)` is active, `automode.py` fails closed (`deny` on classifier error or oversized commands) and returns `force_ask` outside Auto mode so Supervised still prompts.
 
 ## How it compares
 
@@ -19,12 +19,12 @@
 | Two-stage check (fast → reasoned) | ✅ | ✅ | ✅ *(~3.7 s → ~6.3 s)* |
 | Approves safe MCP & unknown commands | ✅ | ❌ *(prompts by default)* | ⚠️ *(yes, stays in sandbox)* |
 | On denial: reason to agent instead of popup | ✅ | ❌ *(popup or turn abort)* | ✅ |
-| Escalates only after 3 denials in a row / 20 total | ✅ | ❌ *(prompts immediately)* | ✅ |
+| Non-blocking on repeated denials | ✅ | ❌ *(prompts immediately)* | ✅ |
 | Scans tool outputs for prompt injection | ✅ | ⚠️ *(undocumented)* | ❌ |
 
 **Safeguards:**
-- **Auto mode only:** Supervised, Auto-accept edits, and Full access stay unchanged.
-- **Fail-safe:** Any failure (missing `agy`/`claude`, timeout, changed `agy` logs) returns no opinion, so `agy` and T3 ask you as before.
+- **Auto mode only:** Supervised, Auto-accept edits, and Full access stay unchanged (with `command(*)` enabled, the hook returns `force_ask` outside Auto mode so Supervised still prompts).
+- **Fail-safe:** Without `command(*)`, any failure (missing `agy`/`claude`, timeout, changed `agy` logs) returns no opinion so `agy` and T3 ask you; with `command(*)` enabled, failures and oversized commands fail closed with `deny`.
 - **Hook precedence:** A `deny` from another hook still wins over this plugin's approval.
 
 ## Install

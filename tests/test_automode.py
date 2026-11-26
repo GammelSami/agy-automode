@@ -82,8 +82,8 @@ with tempfile.TemporaryDirectory() as app:
 
 # T3 Code prepends long <t3_code_instructions> after restarts; stripping it keeps <user_request> inside clip()
 wrapped = '<t3_code_instructions>' + ('x' * 5000) + '</t3_code_instructions>\n\n<user_request>push now</user_request><runtime_info>r</runtime_info>'
-assert automode.user_text(wrapped) == '<user_request>push now</user_request>'
-assert automode.user_text('plain message') == 'plain message'
+assert automode.clean_user_message(wrapped) == 'push now'
+assert automode.clean_user_message('plain message') == 'plain message'
 
 # Outside Auto, or when the classifier fails, the hook has no opinion
 os.environ.pop('AUTOMODE_SESSION_MODE', None)
@@ -97,15 +97,49 @@ try:
 except RuntimeError:
     pass
 
-# Denials: three in a row hand the decision to the human, an allow resets the streak
+# Denials stay non-blocking (never hang unattended runs on interactive prompts)
 answers = iter(['BLOCK', json.dumps({'structured_output': {'decision': 'block', 'reason': 'risky.'}})] * 3)
 automode.claude = lambda *a, **k: next(answers)
 results = [automode.decide(call('run_command', CommandLine='rm -rf /')) for _ in range(3)]
-assert [r['decision'] for r in results] == ['deny', 'deny', 'force_ask'], results
+assert [r['decision'] for r in results] == ['deny', 'deny', 'deny'], results
 assert 'not the user' in results[0]['reason'] and 'risky.' in results[0]['reason']
 automode.claude = lambda *a, **k: 'ALLOW'
 assert automode.decide(call('run_command', CommandLine='npm test')) == {'decision': 'auto_approve'}
-assert automode.decide(call('run_command', CommandLine='echo ' + 'x' * 7000)) is None  # too long to show in full
+assert automode.decide(call('run_command', CommandLine='python3 -c ' + 'x' * 7000)) is None  # too long to show in full
+
+# With command(*) allow rule active: Supervised asks, oversized commands deny, classifier errors fail closed
+with tempfile.TemporaryDirectory() as gemini_dir:
+    conv = '4c8b2960-e3bd-4cd5-be5f-2691f622ebdd'
+    tpath = Path(gemini_dir) / f'antigravity-acp/brain/{conv}/.system_generated/logs/transcript.jsonl'
+    tpath.parent.mkdir(parents=True)
+    (Path(gemini_dir) / 'antigravity-acp/settings.json').write_text(
+        json.dumps({'permissions': {'allow': ['command(*)']}}))
+    wcall = lambda cmd: {**call('run_command', CommandLine=cmd), 'transcriptPath': str(tpath)}
+    assert automode.wildcard_commands(wcall('systemctl --user restart foo'))
+    os.environ.pop('AUTOMODE_SESSION_MODE', None)
+    assert automode.decide(wcall('systemctl --user restart foo'))['decision'] == 'force_ask'
+    assert automode.decide(wcall('git status')) is None  # read-only still passes
+    os.environ['AUTOMODE_SESSION_MODE'] = 'auto'
+    assert automode.decide(wcall('python3 -c ' + 'x' * 7000))['decision'] == 'deny'
+    # main() fails closed with deny when classifier raises while command(*) is active
+    import io
+    automode.claude = lambda *a, **k: (_ for _ in ()).throw(RuntimeError('offline'))
+    real_stdin, real_stdout = sys.stdin, sys.stdout
+    sys.stdin, sys.stdout = io.StringIO(json.dumps(wcall('rm -rf build'))), io.StringIO()
+    try:
+        automode.main()
+        out = json.loads(sys.stdout.getvalue())
+    finally:
+        sys.stdin, sys.stdout = real_stdin, real_stdout
+    assert out['decision'] == 'deny' and 'offline' in out['reason'], out
+    # Also detects command(*) in shared config/config.json
+    (Path(gemini_dir) / 'antigravity-acp/settings.json').unlink()
+    assert not automode.wildcard_commands(wcall('rm -rf build'))
+    (Path(gemini_dir) / 'config').mkdir()
+    (Path(gemini_dir) / 'config/config.json').write_text(
+        json.dumps({'userSettings': {'globalPermissionGrants': {'allow': ['command(*)']}}}))
+    assert automode.wildcard_commands(wcall('rm -rf build'))
+
 # Only a bare ALLOW or BLOCK counts; prose or a JSON fragment inside prose means no opinion
 for first, second in [('**ALLOW** would be unsafe. BLOCK.', ''), ('BLOCK', 'Blocked. {"decision": "allow", "reason": ""}'),
                       ('BLOCK', '{"decision": "allow"}')]:
@@ -275,6 +309,27 @@ automode.subprocess.run = real_run
 os.environ.pop('CLAUDE_CONFIG_DIR')
 if saved_config is not None:
     os.environ['CLAUDE_CONFIG_DIR'] = saved_config
+
+# Harness boilerplate stripping + full-transcript fallback when transcript.jsonl truncates USER_INPUT
+with tempfile.TemporaryDirectory() as folder:
+    t_compact = Path(folder) / 'transcript.jsonl'
+    t_full = Path(folder) / 'transcript_full.jsonl'
+    header = '<t3_code_instructions>\n' + ('x' * 6500) + '\n</t3_code_instructions>\n'
+    full_msg = f'<USER_REQUEST>\n{header}<user_request>\nJa, du darfst pushen.\n</user_request><runtime_info>info</runtime_info>\n</USER_REQUEST>\n<ADDITIONAL_METADATA>now</ADDITIONAL_METADATA>'
+    compact_msg = full_msg[:4000]  # drops <user_request> just like agy's compact transcript
+    t_compact.write_text(
+        json.dumps({'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'content': compact_msg, 'truncated_fields': ['content']}) + '\n'
+        + json.dumps({'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'content': '<USER_REQUEST>\nFix <t3_code_instructions> bug\n</USER_REQUEST>'}) + '\n'
+    )
+    t_full.write_text(
+        json.dumps({'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'content': full_msg}) + '\n'
+        + json.dumps({'source': 'USER_EXPLICIT', 'type': 'USER_INPUT', 'content': '<USER_REQUEST>\nFix <t3_code_instructions> bug\n</USER_REQUEST>'}) + '\n'
+    )
+    probe = call('run_command', CommandLine='git push')
+    probe['transcriptPath'] = str(t_compact)
+    rendered = automode.classifier_input(probe)
+    assert 'Ja, du darfst pushen.' in rendered and 't3_code_instructions' not in rendered.split('---')[0], rendered
+    assert 'Fix <t3_code_instructions> bug' in rendered, rendered  # unclosed mention in user prose survives
 print('offline ok')
 
 if '--live' not in sys.argv:

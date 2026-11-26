@@ -16,9 +16,36 @@ link() {
     fi
 }
 
+allow_commands() {
+    python3 - "$1" "$2" <<'PY'
+import json, os, pathlib, sys
+path, kind = pathlib.Path(sys.argv[1]), sys.argv[2]
+data = json.loads(path.read_text()) if path.exists() else {}
+if kind == 'settings':
+    allow = data.setdefault('permissions', {}).setdefault('allow', [])
+else:
+    allow = data.setdefault('userSettings', {}).setdefault('globalPermissionGrants', {}).setdefault('allow', [])
+if 'command(*)' not in allow:
+    allow.append('command(*)')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
+    tmp = path.with_suffix(path.suffix + '.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, 'w') as f:
+        f.write(json.dumps(data, indent=2) + '\n')
+    os.replace(tmp, path)
+    print(f'added command(*) to {path}')
+PY
+}
+
 link "$HOME/.gemini/config/plugins"
+allow_commands "$HOME/.gemini/config/config.json" config
+allow_commands "$HOME/.gemini/antigravity-cli/settings.json" settings
 for profile in "$HOME"/.t3/userdata/providers/antigravity/*/; do
-    [ -d "$profile" ] && link "${profile}config/plugins"
+    [ -d "$profile" ] || continue
+    link "${profile}config/plugins"
+    allow_commands "${profile}config/config.json" config
+    allow_commands "${profile}antigravity-acp/settings.json" settings
 done
 
 [ -d "$HOME/.gemini/antigravity-cli" ] || echo "note: run 'agy' once in a terminal to sign in (or set AUTOMODE_BACKEND=claude)" >&2

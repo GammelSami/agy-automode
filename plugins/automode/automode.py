@@ -12,7 +12,8 @@ quota in one persistent `stream-json` process), or through an external `claude -
 (`AUTOMODE_BACKEND=claude`).
 
 Printing nothing means "no opinion": agy then applies its normal policy (and T3 asks the human).
-Every failure ends that way, so a broken classifier never approves anything.
+Every failure ends that way, so a broken classifier never approves anything; when agy allows
+command(*), run_command failures deny instead, because no opinion would then fail open.
 """
 import json
 import os
@@ -42,7 +43,6 @@ def default_backend():
 BACKEND = os.environ.get('AUTOMODE_BACKEND') or default_backend()
 MODEL = os.environ.get('AUTOMODE_MODEL') or {'agy': 'claude-sonnet-5-5-low', 'claude': 'sonnet'}.get(BACKEND, '')
 STATE = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'agy-automode'
-MAX_CONSECUTIVE_DENIALS, MAX_TOTAL_DENIALS = 3, 20
 TIMEOUT = 40
 
 READ_TOOLS = {'read_file', 'view_file', 'list_dir', 'grep_search', 'find_by_name', 'view_file_outline', 'view_code_item'}
@@ -342,27 +342,46 @@ def action(call, limit):
     return clip({'tool': call.get('name'), 'args': args}, limit)
 
 
-def user_text(message):
-    """Strip T3 Code's boilerplate wrappers so clip() never drops the actual <user_request>."""
-    message = re.sub(r'^\s*<t3_code_instructions>.*?</t3_code_instructions>\s*', '', message, flags=re.S)
-    return re.sub(r'\s*<runtime_info>.*?</runtime_info>\s*$', '', message, flags=re.S)
+HARNESS_WRAPPER = re.compile(
+    r'<(t3_code_instructions|runtime_info|ADDITIONAL_METADATA|USER_SETTINGS_CHANGE)>.*?</\1>', re.S)
+
+
+def clean_user_message(text):
+    """Strip harness boilerplate (e.g. T3's ~7 KB instruction header) so clip() keeps the user's words."""
+    text = HARNESS_WRAPPER.sub('', text).strip()
+    for tag in ('USER_REQUEST', 'user_request'):
+        match = re.fullmatch(rf'<{tag}>\s*(.*?)\s*</{tag}>', text, re.S)
+        if match:
+            text = match.group(1)
+    return text.strip()
 
 
 def classifier_input(data):
     users, actions = [], []
+    transcript = Path(data.get('transcriptPath', ''))
+    full_lines = None
     try:
-        for line in Path(data.get('transcriptPath', '')).read_text(errors='replace').splitlines():
+        for index, line in enumerate(transcript.read_text(errors='replace').splitlines()):
             try:
                 step = json.loads(line)
             except ValueError:
                 continue
             if step.get('source') == 'USER_EXPLICIT' and step.get('type') == 'USER_INPUT':
-                users.append(user_text(step.get('content') or ''))
+                if 'content' in (step.get('truncated_fields') or []):
+                    if full_lines is None:
+                        full = transcript.with_name('transcript_full.jsonl')
+                        full_lines = full.read_text(errors='replace').splitlines() if full.exists() else []
+                    if index < len(full_lines):
+                        try:
+                            step = json.loads(full_lines[index])
+                        except ValueError:
+                            pass
+                users.append(clean_user_message(step.get('content') or ''))
             actions += [call for call in step.get('tool_calls') or [] if call.get('name')]
     except OSError:
         pass
     if not users and data.get('lastUserInput'):
-        users = [user_text(data['lastUserInput'])]
+        users = [clean_user_message(data['lastUserInput'])]
     # Keep the first message (it usually states the task) and as many recent ones as fit.
     picked, budget = [], 24000
     for message in reversed(users[1:]):
@@ -533,20 +552,29 @@ def classify(prompt):
     return decision.get('decision') == 'allow', decision.get('reason') or 'no reason given'
 
 
-def denials(conversation, allowed):
-    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path = STATE / f"denials-{re.sub(r'[^0-9a-f-]', '', conversation) or 'none'}.json"
-    try:
-        counts = json.loads(path.read_text())
-    except (OSError, ValueError):
-        counts = {'consecutive': 0, 'total': 0}
-    if allowed:
-        counts['consecutive'] = 0
-    else:
-        counts['consecutive'] += 1
-        counts['total'] += 1
-    path.write_text(json.dumps(counts))
-    return counts
+def wildcard_commands(data):
+    """True when agy's settings or shared config grant command(*) — then no-opinion would fail open."""
+    transcript = data.get('transcriptPath', '')
+    if not transcript:
+        return False
+    parents = Path(transcript).parents
+    if len(parents) < 6:
+        return False
+    app_dir = parents[4]  # <gemini_dir>/<app_data_dir>
+    checks = [
+        (app_dir / 'settings.json', ('permissions', 'allow')),
+        (app_dir.parent / 'config/config.json', ('userSettings', 'globalPermissionGrants', 'allow')),
+    ]
+    for path, keys in checks:
+        try:
+            node = json.loads(path.read_text())
+            for key in keys:
+                node = (node or {}).get(key)
+            if isinstance(node, list) and 'command(*)' in node:
+                return True
+        except (OSError, ValueError, AttributeError):
+            pass
+    return False
 
 
 def log(data, decision, reason, started):
@@ -564,23 +592,27 @@ def log(data, decision, reason, started):
 def decide(data):
     if os.environ.get('AUTOMODE_DISABLE') == '1' or data.get('hookEventName', 'PreToolUse') != 'PreToolUse':
         return None
+    call = data.get('toolCall') or {}
+    wildcard_cmd = call.get('name') == 'run_command' and wildcard_commands(data)
     mode = os.environ.get('AUTOMODE_SESSION_MODE') or session_mode(data)
-    if mode != 'auto' or not needs_classifier(data):
+    if not needs_classifier(data):
         return None
-    if len(action(data.get('toolCall') or {}, 10**6)) > 6000:
+    if mode != 'auto':
+        if wildcard_cmd:
+            return {'decision': 'force_ask',
+                    'reason': 'command(*) allow rule is active; asking outside auto mode.'}
+        return None
+    if len(action(call, 10**6)) > 6000:
+        if wildcard_cmd:
+            log(data, 'deny', 'command too long (>6000 chars) to classify safely', time.time())
+            return {'decision': 'deny',
+                    'reason': 'Blocked by auto mode: command exceeds 6000 chars and cannot be classified in full.'}
         return None  # the classifier would only see a clipped action: let the human look at it
     started = time.time()
     allowed, reason = classify(classifier_input(data))
-    counts = denials(data.get('conversationId', ''), allowed)
     if allowed:
         log(data, 'auto_approve', '', started)
         return {'decision': 'auto_approve'}
-    if counts['consecutive'] >= MAX_CONSECUTIVE_DENIALS or counts['total'] >= MAX_TOTAL_DENIALS:
-        if counts['consecutive'] >= MAX_CONSECUTIVE_DENIALS:
-            denials(data.get('conversationId', ''), True)
-        log(data, 'force_ask', reason, started)
-        return {'decision': 'force_ask',
-                'reason': f'Auto mode blocked this repeatedly ({reason}); the user decides.'}
     log(data, 'deny', reason, started)
     return {'decision': 'deny', 'reason': (
         f'Blocked by the auto-mode safety classifier: {reason} This was an automatic check, not the user; '
@@ -596,11 +628,18 @@ def main():
     try:
         data = json.load(sys.stdin)
         result = decide(data)
-    except Exception as error:  # any failure falls back to agy's own policy
+    except Exception as error:  # fail closed when command(*) is active, else fall back to agy
+        msg = f'{type(error).__name__}: {error}'[:300]
         try:
-            log(data, 'error', f'{type(error).__name__}: {error}'[:300], time.time())
+            log(data, 'error', msg, time.time())
         except Exception:
             pass
+        call = data.get('toolCall') or {}
+        if call.get('name') == 'run_command' and wildcard_commands(data) and needs_classifier(data):
+            print(json.dumps({
+                'decision': 'deny',
+                'reason': f'Blocked by auto mode: classifier failed ({msg}); refusing to fail open with command(*).',
+            }))
         return
     if result:
         print(json.dumps(result))
