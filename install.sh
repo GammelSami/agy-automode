@@ -56,7 +56,9 @@ for profile in "$HOME"/.t3/userdata/providers/antigravity/*/; do
     allow_commands "${profile}antigravity-acp/settings.json" settings
 done
 
-[ -d "$HOME/.gemini/antigravity-cli" ] || echo "note: run 'agy' once in a terminal to sign in (or set AUTOMODE_BACKEND=claude)" >&2
+if [ ! -f "$HOME/.gemini/antigravity-cli/antigravity-oauth-token" ]; then
+    echo "note: make sure terminal 'agy' is signed in (run 'agy' once in a terminal, or set AUTOMODE_BACKEND=claude)" >&2
+fi
 
 if [ "${1:-}" = "--timer" ]; then
     units="$HOME/.config/systemd/user"

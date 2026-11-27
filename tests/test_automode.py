@@ -392,7 +392,193 @@ with tempfile.TemporaryDirectory() as folder:
     (Path(folder) / 'transcript_full.jsonl').mkdir()  # reading a directory raises OSError
     probe = call('run_command', CommandLine='git push')
     probe['transcriptPath'] = str(tpath)
-    assert 'Nicht mehr pushen!' in automode.classifier_input(probe)
+    rendered_unreadable = automode.classifier_input(probe)
+    assert 'Nicht mehr pushen!' in rendered_unreadable
+    assert f"conversation={probe['conversationId']}" in rendered_unreadable
+
+# first_pass: only bare ALLOW fast-passes; reasoning + standalone ALLOW/BLOCK escalates to stage 2; mixed prose raises
+assert automode.first_pass('ALLOW') is True
+assert automode.first_pass('**ALLOW**') is True
+assert automode.first_pass('No rule matches this action.\n\nALLOW\n') is False
+assert automode.first_pass('This bypasses the sandbox.\n\n**BLOCK**\n') is False
+for bad in ['', '   ', 'I think ALLOW is fine', '**ALLOW** would be unsafe. BLOCK.']:
+    try:
+        automode.first_pass(bad)
+        raise AssertionError(f'expected ValueError for {bad!r}')
+    except ValueError:
+        pass
+
+# child_agy_env: drops parent T3/Antigravity session vars (like AGY_ACP_FORCE_FILE_STORAGE) and disables recursion
+saved_env = {k: os.environ.get(k) for k in ('AGY_ACP_FORCE_FILE_STORAGE', 'GEMINI_HOME', 'ANTIGRAVITY_APP_DATA_DIR', 'ANTIGRAVITY_LS_ADDRESS')}
+os.environ.update({'AGY_ACP_FORCE_FILE_STORAGE': '1', 'GEMINI_HOME': '/tmp/g', 'ANTIGRAVITY_APP_DATA_DIR': '/tmp/a', 'ANTIGRAVITY_LS_ADDRESS': '127.0.0.1:9'})
+try:
+    cenv = automode.child_agy_env()
+    assert cenv['AUTOMODE_DISABLE'] == '1'
+    for leaked in ('AGY_ACP_FORCE_FILE_STORAGE', 'GEMINI_HOME', 'ANTIGRAVITY_APP_DATA_DIR', 'ANTIGRAVITY_LS_ADDRESS'):
+        assert leaked not in cenv, leaked
+finally:
+    for k, v in saved_env.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+# format_delta: verifies rolling action hashes, rejects edited prior actions and >25-action gaps
+def make_ctx(users, actions_list, pending, workspace='["/w"] cwd=/w conversation=c1'):
+    total = len(actions_list)
+    offset = max(0, total - 25)
+    h = automode.hashlib.sha256()
+    hashes = {}
+    if offset == 0:
+        hashes['0'] = h.hexdigest()[:16]
+    for i, a in enumerate(actions_list, 1):
+        h.update(a.encode('utf-8'))
+        h.update(b'\0')
+        if i >= offset:
+            hashes[str(i)] = h.hexdigest()[:16]
+    return {'workspace': workspace, 'users': users, 'actions_total': total, 'actions_offset': offset,
+            'actions_tail': actions_list[offset:], 'action_hashes': hashes, 'pending': pending}
+
+ctx1 = make_ctx(['u1'], ['a1'], 'p1')
+state1 = automode.snapshot_state(ctx1)
+ctx2 = make_ctx(['u1', 'u2'], ['a1', 'a2'], 'p2')
+delta2 = automode.format_delta(ctx2, state1)
+assert delta2 is not None and 'u2' in delta2 and 'u1' not in delta2 and 'a2' in delta2 and 'a1' not in delta2 and 'p2' in delta2, delta2
+assert automode.format_delta(make_ctx(['edited', 'u2'], ['a1', 'a2'], 'p2'), state1) is None  # edited user history
+assert automode.format_delta(make_ctx(['u1', 'u2'], ['a1-edited', 'a2'], 'p2'), state1) is None  # edited earlier action
+assert automode.format_delta(make_ctx(['u1'], ['a1'] + [f'x{i}' for i in range(26)], 'p2'), state1) is None  # >25 gap
+assert automode.format_delta(make_ctx(['u1', 'u2'], ['a1', 'a2'], 'p2', workspace='["/other"]'), state1) is None
+assert automode.format_delta(make_ctx(['u1'], [], 'p2'), state1) is None  # rollback
+
+# Claude backend session reuse within CACHE_TTL: reuses session on consecutive ALLOWs, retires after stage 2
+claude_calls = []
+fake_responses = iter(['ALLOW', 'ALLOW', 'BLOCK', '{"decision": "allow", "reason": "ok"}', 'ALLOW'])
+def stub_claude(prompt, session, resume=False, model=None, timeout=None):
+    claude_calls.append((prompt, session, resume, model))
+    return next(fake_responses)
+automode.claude, automode.BACKEND = stub_claude, 'claude'
+reuse_cid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+# Call 1 (cold): ALLOW -> session saved
+assert automode._classify(ctx1, reuse_cid)[:3] == (True, '', {'backend': 'claude', 'reused': False})
+# Call 2 (warm): ALLOW -> same session resumed with delta only
+assert automode._classify(ctx2, reuse_cid)[:3] == (True, '', {'backend': 'claude', 'reused': True})
+assert claude_calls[0][1] == claude_calls[1][1] and not claude_calls[0][2] and claude_calls[1][2]
+assert '<new_user_messages>' in claude_calls[1][0] and 'u1' not in claude_calls[1][0]
+# Call 3 (warm): BLOCK -> stage 2 resumes same session, then retires it
+ctx3 = make_ctx(['u1', 'u2'], ['a1', 'a2', 'a3'], 'p3')
+assert automode._classify(ctx3, reuse_cid)[:3] == (True, 'ok', {'backend': 'claude', 'reused': True})
+assert claude_calls[2][1] == claude_calls[0][1] and claude_calls[3][1] == claude_calls[0][1] and claude_calls[3][2]
+# Call 4 (after stage-2 retirement): fresh session UUID, not resumed
+ctx4 = make_ctx(['u1', 'u2'], ['a1', 'a2', 'a3', 'a4'], 'p4')
+assert automode._classify(ctx4, reuse_cid)[:3] == (True, '', {'backend': 'claude', 'reused': False})
+assert claude_calls[4][1] != claude_calls[0][1] and not claude_calls[4][2]
+automode.claude = real_claude
+
+# Persistent agy worker over Unix socket: reuses one stream-json process across ALLOWs, retires after stage 2 & cleans up
+import threading
+with tempfile.TemporaryDirectory() as wtmp:
+    os.chmod(wtmp, 0o700)
+    spawn_log = Path(wtmp) / 'spawns.log'
+    fake_worker_agy = Path(wtmp) / 'fake_worker_agy.py'
+    fake_worker_agy.write_text(
+        '#!/usr/bin/env python3\nimport json, sys\n'
+        f'open({str(spawn_log)!r}, "a").write("spawn\\n")\n'
+        'turn = 0\n'
+        'for line in sys.stdin:\n'
+        '    msg = json.loads(line)["message"]["content"]\n'
+        '    turn += 1\n'
+        '    if turn == 1:\n'
+        '        print(json.dumps({"event": "init", "conversation_id": "' + cid + '"}), flush=True)\n'
+        '    if "careful second pass" in msg:\n'
+        '        resp = json.dumps({"decision": "allow", "reason": "cleared in stage 2"})\n'
+        '    elif "trigger-block" in msg:\n'
+        '        resp = "Needs stage 2.\\n\\nALLOW\\n"\n'
+        '    else:\n'
+        '        resp = "ALLOW"\n'
+        '    print(json.dumps({"event": "result", "result": {"conversation_id": "' + cid + '", "status": "SUCCESS", "response": resp}}), flush=True)\n'
+    )
+    fake_worker_agy.chmod(0o755)
+    saved_find, saved_ttl, saved_backend = automode.find, automode.CACHE_TTL, automode.BACKEND
+    automode.find = lambda name: str(fake_worker_agy) if name == 'agy' else saved_find(name)
+    automode.CACHE_TTL = 0.5
+    automode.BACKEND = 'agy'
+    sock_path = Path(wtmp) / 'worker.sock'
+    t = threading.Thread(target=automode.run_worker, args=(str(sock_path), 'test-model'), daemon=True)
+    t.start()
+    deadline = automode.time.monotonic() + 2.0
+    while not sock_path.exists() and automode.time.monotonic() < deadline:
+        automode.time.sleep(0.02)
+    assert sock_path.exists() and automode.worker_is_running(sock_path)
+    r1 = automode.query_agy_worker(sock_path, ctx1, 'test-model')
+    r2 = automode.query_agy_worker(sock_path, ctx2, 'test-model')
+    # Call 3 has preamble + ALLOW -> escalates to stage 2 (strict JSON), then retires process
+    r3 = automode.query_agy_worker(sock_path, {**ctx3, 'pending': 'trigger-block'}, 'test-model')
+    r4 = automode.query_agy_worker(sock_path, ctx4, 'test-model')
+    assert r1 == {'ok': True, 'allowed': True, 'reason': '', 'reused': False}, r1
+    assert r2 == {'ok': True, 'allowed': True, 'reason': '', 'reused': True}, r2
+    assert r3 == {'ok': True, 'allowed': True, 'reason': 'cleared in stage 2', 'reused': True}, r3
+    assert r4 == {'ok': True, 'allowed': True, 'reason': '', 'reused': False}, r4
+    # Calls 1-3 shared 1 agy process; call 4 spawned a 2nd after stage-2 retirement
+    assert len(spawn_log.read_text().splitlines()) == 2
+    t.join(timeout=3.0)
+    assert not t.is_alive() and not sock_path.exists()
+    # ensure_private_dir rejects world-accessible directories and symlinks
+    pub_dir = Path(wtmp) / 'public'
+    pub_dir.mkdir()
+    os.chmod(pub_dir, 0o755)
+    assert not automode.ensure_private_dir(pub_dir)
+    sym_dir = Path(wtmp) / 'sym'
+    sym_dir.symlink_to(wtmp)
+    assert not automode.ensure_private_dir(sym_dir)
+    automode.find, automode.CACHE_TTL, automode.BACKEND = saved_find, saved_ttl, saved_backend
+
+# Auth error fallback: only AgyAuthError (CLI auth failure) triggers fallback, never model-text ValueError
+saved_env_backend = os.environ.pop('AUTOMODE_BACKEND', None)
+saved_classify_agy, saved_find, saved_claude, saved_backend = automode.classify_agy, automode.find, automode.claude, automode.BACKEND
+agy_attempts, claude_fb_calls = [], []
+def failing_agy_auth(*a, **k):
+    agy_attempts.append(1)
+    raise automode.AgyAuthError('agy failed: authentication failed or timed out')
+def failing_agy_parse(*a, **k):
+    raise ValueError('unexpected first-pass answer: mentions oauth login')
+def fb_claude(prompt, session, resume=False, model=None, timeout=None):
+    claude_fb_calls.append((model, resume))
+    return 'ALLOW'
+automode.BACKEND = 'agy'
+automode.claude = fb_claude
+automode.find = lambda name: f'/bin/{name}'
+(automode.STATE / 'agy_auth_cooldown.json').unlink(missing_ok=True)
+try:
+    # Model-text ValueError mentioning "oauth" must NOT trigger auth fallback or cooldown
+    automode.classify_agy = failing_agy_parse
+    try:
+        automode._classify('prompt0')
+        raise AssertionError('expected ValueError without fallback')
+    except ValueError:
+        pass
+    assert not automode.agy_in_auth_cooldown() and not claude_fb_calls
+    # Real AgyAuthError triggers fallback + cooldown
+    automode.classify_agy = failing_agy_auth
+    res_a = automode._classify('prompt1')
+    res_b = automode._classify('prompt2')
+    assert res_a == (True, '', {'backend': 'claude', 'reused': False}), res_a
+    assert res_b == (True, '', {'backend': 'claude', 'reused': False}), res_b
+    assert len(agy_attempts) == 1  # second call skipped agy during cooldown
+    assert claude_fb_calls == [('sonnet', False), ('sonnet', False)], claude_fb_calls
+    # Explicit AUTOMODE_BACKEND=agy must NOT fall back
+    os.environ['AUTOMODE_BACKEND'] = 'agy'
+    try:
+        automode._classify('prompt3')
+        raise AssertionError('expected AgyAuthError when AUTOMODE_BACKEND=agy is pinned')
+    except automode.AgyAuthError:
+        pass
+finally:
+    (automode.STATE / 'agy_auth_cooldown.json').unlink(missing_ok=True)
+    automode.classify_agy, automode.find, automode.claude, automode.BACKEND = saved_classify_agy, saved_find, saved_claude, saved_backend
+    if saved_env_backend is not None:
+        os.environ['AUTOMODE_BACKEND'] = saved_env_backend
+    else:
+        os.environ.pop('AUTOMODE_BACKEND', None)
 
 print('offline ok')
 
