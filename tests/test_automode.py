@@ -450,9 +450,10 @@ assert automode.format_delta(make_ctx(['u1'], ['a1'] + [f'x{i}' for i in range(2
 assert automode.format_delta(make_ctx(['u1', 'u2'], ['a1', 'a2'], 'p2', workspace='["/other"]'), state1) is None
 assert automode.format_delta(make_ctx(['u1'], [], 'p2'), state1) is None  # rollback
 
-# Claude backend session reuse within CACHE_TTL: reuses session on consecutive ALLOWs, retires after stage 2
+# Claude backend session reuse within CACHE_TTL: stays warm after stage 2, retries fresh once on format drift
 claude_calls = []
-fake_responses = iter(['ALLOW', 'ALLOW', 'BLOCK', '{"decision": "allow", "reason": "ok"}', 'ALLOW'])
+fake_responses = iter(['ALLOW', 'ALLOW', 'BLOCK', '{"decision": "allow", "reason": "ok"}', 'ALLOW',
+                       '{"decision": "allow", "reason": "drifted"}', 'ALLOW'])
 def stub_claude(prompt, session, resume=False, model=None, timeout=None):
     claude_calls.append((prompt, session, resume, model))
     return next(fake_responses)
@@ -464,17 +465,21 @@ assert automode._classify(ctx1, reuse_cid)[:3] == (True, '', {'backend': 'claude
 assert automode._classify(ctx2, reuse_cid)[:3] == (True, '', {'backend': 'claude', 'reused': True})
 assert claude_calls[0][1] == claude_calls[1][1] and not claude_calls[0][2] and claude_calls[1][2]
 assert '<new_user_messages>' in claude_calls[1][0] and 'u1' not in claude_calls[1][0]
-# Call 3 (warm): BLOCK -> stage 2 resumes same session, then retires it
+# Call 3 (warm): BLOCK -> stage 2 resumes same session and keeps it warm
 ctx3 = make_ctx(['u1', 'u2'], ['a1', 'a2', 'a3'], 'p3')
 assert automode._classify(ctx3, reuse_cid)[:3] == (True, 'ok', {'backend': 'claude', 'reused': True})
 assert claude_calls[2][1] == claude_calls[0][1] and claude_calls[3][1] == claude_calls[0][1] and claude_calls[3][2]
-# Call 4 (after stage-2 retirement): fresh session UUID, not resumed
+# Call 4 (warm after stage 2): STILL reuses same session UUID with reset separator
 ctx4 = make_ctx(['u1', 'u2'], ['a1', 'a2', 'a3', 'a4'], 'p4')
-assert automode._classify(ctx4, reuse_cid)[:3] == (True, '', {'backend': 'claude', 'reused': False})
-assert claude_calls[4][1] != claude_calls[0][1] and not claude_calls[4][2]
+assert automode._classify(ctx4, reuse_cid)[:3] == (True, '', {'backend': 'claude', 'reused': True})
+assert claude_calls[4][1] == claude_calls[0][1] and claude_calls[4][2] and 'New independent check' in claude_calls[4][0]
+# Call 5 (format drift on reused session): retries once fresh instead of failing
+ctx5 = make_ctx(['u1', 'u2'], ['a1', 'a2', 'a3', 'a4', 'a5'], 'p5')
+assert automode._classify(ctx5, reuse_cid)[:3] == (True, '', {'backend': 'claude', 'reused': False})
+assert claude_calls[5][1] == claude_calls[0][1] and claude_calls[6][1] != claude_calls[0][1] and not claude_calls[6][2]
 automode.claude = real_claude
 
-# Persistent agy worker over Unix socket: reuses one stream-json process across ALLOWs, retires after stage 2 & cleans up
+# Persistent agy worker over Unix socket: stays warm across stage 2, retries fresh once on format drift, cleans up on idle
 import threading
 with tempfile.TemporaryDirectory() as wtmp:
     os.chmod(wtmp, 0o700)
@@ -493,6 +498,8 @@ with tempfile.TemporaryDirectory() as wtmp:
         '        resp = json.dumps({"decision": "allow", "reason": "cleared in stage 2"})\n'
         '    elif "trigger-block" in msg:\n'
         '        resp = "Needs stage 2.\\n\\nALLOW\\n"\n'
+        '    elif "trigger-drift" in msg and turn > 1:\n'
+        '        resp = json.dumps({"decision": "allow", "reason": "drifted"})\n'
         '    else:\n'
         '        resp = "ALLOW"\n'
         '    print(json.dumps({"event": "result", "result": {"conversation_id": "' + cid + '", "status": "SUCCESS", "response": resp}}), flush=True)\n'
@@ -511,14 +518,18 @@ with tempfile.TemporaryDirectory() as wtmp:
     assert sock_path.exists() and automode.worker_is_running(sock_path)
     r1 = automode.query_agy_worker(sock_path, ctx1, 'test-model')
     r2 = automode.query_agy_worker(sock_path, ctx2, 'test-model')
-    # Call 3 has preamble + ALLOW -> escalates to stage 2 (strict JSON), then retires process
+    # Call 3 has preamble + ALLOW -> escalates to stage 2 (strict JSON), keeps session warm
     r3 = automode.query_agy_worker(sock_path, {**ctx3, 'pending': 'trigger-block'}, 'test-model')
+    # Call 4 right after stage 2 STILL reuses the same warm agy process
     r4 = automode.query_agy_worker(sock_path, ctx4, 'test-model')
+    # Call 5 drifts into JSON on reused session -> worker retries once fresh transparently
+    r5 = automode.query_agy_worker(sock_path, {**ctx5, 'pending': 'trigger-drift'}, 'test-model')
     assert r1 == {'ok': True, 'allowed': True, 'reason': '', 'reused': False}, r1
     assert r2 == {'ok': True, 'allowed': True, 'reason': '', 'reused': True}, r2
     assert r3 == {'ok': True, 'allowed': True, 'reason': 'cleared in stage 2', 'reused': True}, r3
-    assert r4 == {'ok': True, 'allowed': True, 'reason': '', 'reused': False}, r4
-    # Calls 1-3 shared 1 agy process; call 4 spawned a 2nd after stage-2 retirement
+    assert r4 == {'ok': True, 'allowed': True, 'reason': '', 'reused': True}, r4
+    assert r5 == {'ok': True, 'allowed': True, 'reason': '', 'reused': False}, r5
+    # Calls 1-4 shared 1 agy process; only call 5's drift retry spawned a 2nd
     assert len(spawn_log.read_text().splitlines()) == 2
     t.join(timeout=3.0)
     assert not t.is_alive() and not sock_path.exists()
@@ -579,6 +590,81 @@ finally:
         os.environ['AUTOMODE_BACKEND'] = saved_env_backend
     else:
         os.environ.pop('AUTOMODE_BACKEND', None)
+
+# Quota error fallback: AgyQuotaError -> Option A (claude CLI sonnet) -> Option B (agy gemini-4-neon-low)
+saved_env_backend = os.environ.pop('AUTOMODE_BACKEND', None)
+saved_env_model = os.environ.pop('AUTOMODE_MODEL', None)
+saved_classify_agy, saved_find, saved_claude, saved_backend, saved_model = (
+    automode.classify_agy, automode.find, automode.claude, automode.BACKEND, automode.MODEL)
+quota_agy_calls, quota_claude_calls = [], []
+claude_should_fail = False
+def quota_agy(prompt, model=None, deadline=None):
+    quota_agy_calls.append(model)
+    if model == automode.AGY_GEMINI_FALLBACK:
+        return True, ''
+    raise automode.AgyQuotaError('agy failed: Third-party quota reached. Please switch to Gemini models. Resets in 132h26m5s.')
+def quota_claude(prompt, session, resume=False, model=None, timeout=None):
+    quota_claude_calls.append(model)
+    if claude_should_fail:
+        raise RuntimeError('claude exited 1: Not logged in')
+    return 'ALLOW'
+automode.BACKEND, automode.MODEL = 'agy', automode.DEFAULT_MODELS['agy']
+automode.classify_agy, automode.claude = quota_agy, quota_claude
+automode.find = lambda name: f'/bin/{name}'
+for name in ('agy_auth_cooldown.json', 'agy_quota_cooldown.json', 'claude_fallback_cooldown.json'):
+    (automode.STATE / name).unlink(missing_ok=True)
+try:
+    # Model-output ValueError mentioning quota must NOT trigger quota fallback
+    automode.classify_agy = lambda *a, **k: (_ for _ in ()).throw(ValueError('unexpected first-pass answer: quota reached'))
+    try:
+        automode._classify('p0')
+        raise AssertionError('expected ValueError without quota fallback')
+    except ValueError:
+        pass
+    assert not automode.agy_in_quota_cooldown() and not quota_claude_calls
+    # Real AgyQuotaError -> Option A (claude sonnet) + quota cooldown
+    automode.classify_agy = quota_agy
+    r1 = automode._classify('p1')
+    r2 = automode._classify('p2')
+    assert r1 == (True, '', {'backend': 'claude', 'reused': False, 'fallback': 'quota'}), r1
+    assert r2 == (True, '', {'backend': 'claude', 'reused': False, 'fallback': 'quota'}), r2
+    assert quota_agy_calls == [automode.DEFAULT_MODELS['agy']]  # 2nd call skipped agy Claude during cooldown
+    assert quota_claude_calls == ['sonnet', 'sonnet']
+    # If claude CLI also fails (e.g. not signed in on AgentPi) -> Option B (agy gemini-4-neon-low) + claude cooldown
+    claude_should_fail = True
+    r3 = automode._classify('p3')
+    r4 = automode._classify('p4')
+    assert r3 == (True, '', {'backend': 'agy', 'model': automode.AGY_GEMINI_FALLBACK, 'reused': False, 'fallback': 'quota'}), r3
+    assert r4 == (True, '', {'backend': 'agy', 'model': automode.AGY_GEMINI_FALLBACK, 'reused': False, 'fallback': 'quota'}), r4
+    assert len(quota_claude_calls) == 3  # 4th call skipped broken claude during cooldown
+    assert quota_agy_calls[-2:] == [automode.AGY_GEMINI_FALLBACK, automode.AGY_GEMINI_FALLBACK]
+    # Explicit AUTOMODE_BACKEND=agy skips claude and uses Option B directly; pinning AUTOMODE_MODEL too disables fallback
+    for name in ('agy_quota_cooldown.json', 'claude_fallback_cooldown.json'):
+        (automode.STATE / name).unlink(missing_ok=True)
+    os.environ['AUTOMODE_BACKEND'] = 'agy'
+    r5 = automode._classify('p5')
+    assert r5 == (True, '', {'backend': 'agy', 'model': automode.AGY_GEMINI_FALLBACK, 'reused': False, 'fallback': 'quota'}), r5
+    assert len(quota_claude_calls) == 3
+    (automode.STATE / 'agy_quota_cooldown.json').unlink(missing_ok=True)
+    os.environ['AUTOMODE_MODEL'] = automode.DEFAULT_MODELS['agy']
+    try:
+        automode._classify('p6')
+        raise AssertionError('expected AgyQuotaError when both backend and model are pinned')
+    except automode.AgyQuotaError:
+        pass
+finally:
+    for name in ('agy_auth_cooldown.json', 'agy_quota_cooldown.json', 'claude_fallback_cooldown.json'):
+        (automode.STATE / name).unlink(missing_ok=True)
+    automode.classify_agy, automode.find, automode.claude, automode.BACKEND, automode.MODEL = (
+        saved_classify_agy, saved_find, saved_claude, saved_backend, saved_model)
+    if saved_env_backend is not None:
+        os.environ['AUTOMODE_BACKEND'] = saved_env_backend
+    else:
+        os.environ.pop('AUTOMODE_BACKEND', None)
+    if saved_env_model is not None:
+        os.environ['AUTOMODE_MODEL'] = saved_env_model
+    else:
+        os.environ.pop('AUTOMODE_MODEL', None)
 
 print('offline ok')
 

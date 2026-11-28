@@ -47,20 +47,36 @@ def default_backend():
 
 
 DEFAULT_MODELS = {'agy': 'claude-sonnet-5-5-low', 'claude': 'sonnet'}
+AGY_GEMINI_FALLBACK = 'gemini-4-neon-low'
 BACKEND = os.environ.get('AUTOMODE_BACKEND') or default_backend()
 MODEL = os.environ.get('AUTOMODE_MODEL') or DEFAULT_MODELS.get(BACKEND, '')
 STATE = Path(os.environ.get('XDG_STATE_HOME') or Path.home() / '.local/state') / 'agy-automode'
 TIMEOUT = 40
 HOOK_BUDGET = 80  # stay safely under hooks.json's 90s timeout so fail-closed deny always completes
 CACHE_TTL = 270  # stay within Anthropic's 5-minute prompt cache window
-MAX_SESSION_TURNS = 20
+MAX_SESSION_TURNS = 100  # safety ceiling for sliding-TTL marathon runs; normal sessions ride the full cache window
 AGY_AUTH_COOLDOWN = 300
+AGY_QUOTA_COOLDOWN = 900
+CLAUDE_FALLBACK_COOLDOWN = 300
 PARENT_AGY_ENV = ('AGY_ACP_FORCE_FILE_STORAGE', 'GEMINI_HOME')
 AUTH_ERROR_RE = re.compile(r'auth(?:entication)?\s+failed|not\s+authenticated|unauthenticated|sign\s+in|oauth|login\s+required', re.I)
+QUOTA_ERROR_RE = re.compile(r'quota\s+reached|third-party\s+quota|rate\s+limit|too\s+many\s+requests|limit\s+reached|resets\s+in\s+\d+[hms]', re.I)
 
 
 class AgyAuthError(RuntimeError):
     """Raised only when the `agy` CLI itself fails with an authentication error (never on model output)."""
+
+
+class AgyQuotaError(RuntimeError):
+    """Raised only when the `agy` CLI itself fails with a quota or rate-limit error (never on model output)."""
+
+
+def agy_error(msg):
+    if AUTH_ERROR_RE.search(msg):
+        return AgyAuthError(msg)
+    if QUOTA_ERROR_RE.search(msg):
+        return AgyQuotaError(msg)
+    return RuntimeError(msg)
 
 
 def budget_left(deadline, cap=None):
@@ -667,18 +683,18 @@ class AgySession:
                     self.conversation = res.get('conversation_id') or self.conversation
                     if res.get('status') != 'SUCCESS':
                         msg = f"agy failed: {res.get('error') or res.get('status')}"
-                        raise (AgyAuthError(msg) if AUTH_ERROR_RE.search(msg) else RuntimeError(msg))
+                        raise agy_error(msg)
                     return res.get('response') or ''
                 elif event.get('event') == 'error':
                     msg = f'agy error: {str(event)[-300:]}'
-                    raise (AgyAuthError(msg) if AUTH_ERROR_RE.search(msg) else RuntimeError(msg))
+                    raise agy_error(msg)
         finally:
             timer.cancel()
         if timed_out or time.monotonic() > turn_deadline:
             raise TimeoutError(f'agy timed out after {limit:.1f}s')
         err = self.stderr_path.read_text(errors='replace')[-300:]
         msg = f'agy ended without result: {err}'
-        raise (AgyAuthError(msg) if AUTH_ERROR_RE.search(msg) else RuntimeError(msg))
+        raise agy_error(msg)
 
     def close(self, check_exit=False, force=False):
         err, rc = '', 0
@@ -718,7 +734,7 @@ class AgySession:
             shutil.rmtree(self.folder, ignore_errors=True)
         if check_exit and rc != 0:
             msg = f'agy exited {rc}: {err}'
-            raise (AgyAuthError(msg) if AUTH_ERROR_RE.search(msg) else RuntimeError(msg))
+            raise agy_error(msg)
 
 
 def classify_agy(prompt, model=None, deadline=None):
@@ -769,7 +785,7 @@ def worker_socket_path(key):
 
 def run_worker(sock_path_str, model):
     """Keeps one warm `agy stream-json` process per conversation for up to CACHE_TTL idle seconds so consecutive
-    tool calls skip agy startup (~2.5s) and hit the 5-minute prompt cache. Retires the agy process after stage 2,
+    tool calls skip agy startup (~2.5s) and hit the 5-minute prompt cache. Retires the agy process after
     MAX_SESSION_TURNS, any error, or idle expiry, deleting its throwaway conversation."""
     sock_path = Path(sock_path_str)
     if not ensure_private_dir(sock_path.parent):
@@ -793,12 +809,12 @@ def run_worker(sock_path_str, model):
         my_ino = sock_path.stat().st_ino
         srv.settimeout(CACHE_TTL)
 
-        session, prev_state, turns = None, None, 0
+        session, prev_state, turns, after_stage2 = None, None, 0, False
 
         def reset(check_exit=False, force=False):
-            nonlocal session, prev_state, turns
+            nonlocal session, prev_state, turns, after_stage2
             cur = session
-            session, prev_state, turns = None, None, 0
+            session, prev_state, turns, after_stage2 = None, None, 0, False
             if cur is not None:
                 cur.close(check_exit=check_exit, force=force)
 
@@ -840,17 +856,30 @@ def run_worker(sock_path_str, model):
                             session = AgySession(model)
                             text = POLICY + '\n\n' + format_full(ctx) + FAST
                         else:
-                            text = delta + FAST
-                        if first_pass(session.turn(text, deadline=req_deadline)):
-                            prev_state = snapshot_state(ctx)
+                            prefix = 'New independent check (ignore previous second-pass JSON/reasoning).\n\n' if after_stage2 else ''
+                            text = prefix + delta + FAST
+                        try:
+                            allow_fast = first_pass(session.turn(text, deadline=req_deadline))
+                        except ValueError:
+                            if not reused:
+                                raise
+                            # Format drift (e.g. echoing prior stage-2 JSON) on a reused session: retry once fresh.
+                            reset(force=True)
+                            reused = False
+                            session = AgySession(model)
+                            allow_fast = first_pass(session.turn(POLICY + '\n\n' + format_full(ctx) + FAST, deadline=req_deadline))
+                        if allow_fast:
+                            prev_state, after_stage2 = snapshot_state(ctx), False
                             turns += 1
                             if turns >= MAX_SESSION_TURNS:
                                 reset(check_exit=False)
                             reply = {'ok': True, 'allowed': True, 'reason': '', 'reused': reused}
                         else:
                             decision = verdict(session.turn(REASONED.strip(), deadline=req_deadline))
-                            # Retire after stage 2 so its prose/JSON never contaminates subsequent stage-1 checks.
-                            reset(check_exit=True)
+                            prev_state, after_stage2 = snapshot_state(ctx), True
+                            turns += 1
+                            if turns >= MAX_SESSION_TURNS:
+                                reset(check_exit=True)
                             reply = {'ok': True, 'allowed': decision.get('decision') == 'allow',
                                      'reason': decision.get('reason') or 'no reason given', 'reused': reused}
                     except Exception as exc:
@@ -977,6 +1006,8 @@ def classify_agy_cached(ctx, conversation_id, model=None, deadline=None):
         etype = reply.get('error_type')
         if etype == 'AgyAuthError':
             raise AgyAuthError(err)
+        if etype == 'AgyQuotaError':
+            raise AgyQuotaError(err)
         if etype == 'TimeoutError':
             raise TimeoutError(err)
         if etype == 'ValueError':
@@ -1069,14 +1100,16 @@ def classify_claude(prompt_or_ctx, conversation_id=None, model=None, deadline=No
             return classify_claude(format_full(prompt_or_ctx), None, model=model, deadline=deadline)
         now = time.time()
         sweep_expired_claude_sessions(sdir, now, skip_key=key)
-        session, turns, delta = None, 0, None
+        session, turns, delta, after_stage2 = None, 0, None, False
         if meta_path.exists():
             try:
                 meta = json.loads(meta_path.read_text())
                 if now - float(meta.get('last_used', 0)) < CACHE_TTL and int(meta.get('turns', 0)) < MAX_SESSION_TURNS:
                     delta = format_delta(prompt_or_ctx, meta.get('state'))
                     if delta is not None:
-                        session, turns = meta.get('session'), int(meta.get('turns', 0))
+                        session = meta.get('session')
+                        turns = int(meta.get('turns', 0))
+                        after_stage2 = bool(meta.get('after_stage2'))
                 if delta is None:
                     forget(meta.get('session'))
                     meta_path.unlink(missing_ok=True)
@@ -1084,28 +1117,38 @@ def classify_claude(prompt_or_ctx, conversation_id=None, model=None, deadline=No
                 meta_path.unlink(missing_ok=True)
         reused = bool(session and delta is not None)
         if not reused:
-            session, turns = str(uuid.uuid4()), 0
+            session, turns, after_stage2 = str(uuid.uuid4()), 0, False
             turn_text = format_full(prompt_or_ctx) + FAST
         else:
-            turn_text = delta + FAST
+            prefix = 'New independent check (ignore previous second-pass JSON/reasoning).\n\n' if after_stage2 else ''
+            turn_text = prefix + delta + FAST
         try:
-            if first_pass(_claude_call(turn_text, session, resume=reused, model=model, deadline=deadline)):
-                turns += 1
-                if turns < MAX_SESSION_TURNS:
-                    write_private_json(meta_path, {'session': session, 'last_used': time.time(),
-                                                   'turns': turns, 'state': snapshot_state(prompt_or_ctx)})
-                else:
-                    meta_path.unlink(missing_ok=True)
-                    forget(session)
-                return True, '', reused
-            decision = verdict(_claude_call(REASONED.strip(), session, resume=True, model=model, deadline=deadline))
+            try:
+                allow_fast = first_pass(_claude_call(turn_text, session, resume=reused, model=model, deadline=deadline))
+            except ValueError:
+                if not reused:
+                    raise
+                meta_path.unlink(missing_ok=True)
+                forget(session)
+                session, turns, reused, after_stage2 = str(uuid.uuid4()), 0, False, False
+                allow_fast = first_pass(_claude_call(format_full(prompt_or_ctx) + FAST, session, resume=False, model=model, deadline=deadline))
+            if allow_fast:
+                allowed, reason, next_stage2 = True, '', False
+            else:
+                decision = verdict(_claude_call(REASONED.strip(), session, resume=True, model=model, deadline=deadline))
+                allowed, reason, next_stage2 = decision.get('decision') == 'allow', decision.get('reason') or 'no reason given', True
         except Exception:
             meta_path.unlink(missing_ok=True)
             forget(session)
             raise
-        meta_path.unlink(missing_ok=True)
-        forget(session)
-        return decision.get('decision') == 'allow', decision.get('reason') or 'no reason given', reused
+        turns += 1
+        if turns < MAX_SESSION_TURNS:
+            write_private_json(meta_path, {'session': session, 'last_used': time.time(), 'turns': turns,
+                                           'after_stage2': next_stage2, 'state': snapshot_state(prompt_or_ctx)})
+        else:
+            meta_path.unlink(missing_ok=True)
+            forget(session)
+        return allowed, reason, reused
 
 
 def agy_cli_stamp():
@@ -1131,31 +1174,109 @@ def mark_agy_auth_failed():
         pass
 
 
+def claude_dir_stamp():
+    cfg = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
+    creds = cfg / '.credentials.json'
+    return [int(p.stat().st_mtime) if p.exists() else 0 for p in (cfg, creds)]
+
+
+def agy_in_quota_cooldown():
+    path = STATE / 'agy_quota_cooldown.json'
+    try:
+        info = json.loads(path.read_text())
+        return time.time() < float(info.get('until', 0)) and info.get('model') == MODEL
+    except Exception:
+        return False
+
+
+def mark_agy_quota_failed():
+    try:
+        write_private_json(STATE / 'agy_quota_cooldown.json',
+                           {'until': time.time() + AGY_QUOTA_COOLDOWN, 'model': MODEL})
+    except Exception:
+        pass
+
+
+def claude_fallback_in_cooldown():
+    path = STATE / 'claude_fallback_cooldown.json'
+    try:
+        info = json.loads(path.read_text())
+        return time.time() < float(info.get('until', 0)) and info.get('stamp') == claude_dir_stamp()
+    except Exception:
+        return False
+
+
+def mark_claude_fallback_failed():
+    try:
+        write_private_json(STATE / 'claude_fallback_cooldown.json',
+                           {'until': time.time() + CLAUDE_FALLBACK_COOLDOWN, 'stamp': claude_dir_stamp()})
+    except Exception:
+        pass
+
+
 def is_auth_error(exc):
     return isinstance(exc, AgyAuthError)
 
 
+def is_quota_error(exc):
+    return isinstance(exc, AgyQuotaError)
+
+
+def _classify_agy_with_model(prompt_or_ctx, conversation_id, model, deadline):
+    if isinstance(prompt_or_ctx, dict):
+        return classify_agy_cached(prompt_or_ctx, conversation_id, model=model, deadline=deadline)
+    allowed, reason = classify_agy(prompt_or_ctx, model=model, deadline=deadline)
+    return allowed, reason, False
+
+
+def _classify_quota_fallback(prompt_or_ctx, conversation_id, deadline, can_claude, can_gemini):
+    """When agy hits third-party quota: prefer external `claude` CLI (Option A), fall back to agy Gemini (Option B)."""
+    last_exc = None
+    if can_claude and not claude_fallback_in_cooldown():
+        try:
+            allowed, reason, reused = classify_claude(prompt_or_ctx, conversation_id,
+                                                      model=DEFAULT_MODELS['claude'], deadline=deadline)
+            return allowed, reason, {'backend': 'claude', 'reused': reused, 'fallback': 'quota'}
+        except Exception as exc:
+            last_exc = exc
+            if not isinstance(exc, ValueError):
+                mark_claude_fallback_failed()
+            if not can_gemini or (deadline is not None and (deadline - time.monotonic()) <= 8.0):
+                raise
+    if can_gemini:
+        allowed, reason, reused = _classify_agy_with_model(prompt_or_ctx, conversation_id, AGY_GEMINI_FALLBACK, deadline)
+        return allowed, reason, {'backend': 'agy', 'model': AGY_GEMINI_FALLBACK, 'reused': reused, 'fallback': 'quota'}
+    if last_exc is not None:
+        raise last_exc
+    raise AgyQuotaError('agy quota reached and no fallback available')
+
+
 def _classify(prompt_or_ctx, conversation_id=None, deadline=None):
     """Returns (allowed, reason, meta_dict)."""
-    can_fallback = not os.environ.get('AUTOMODE_BACKEND') and BACKEND == 'agy' and bool(find('claude'))
+    can_claude_fallback = not os.environ.get('AUTOMODE_BACKEND') and BACKEND == 'agy' and bool(find('claude'))
+    can_gemini_fallback = BACKEND == 'agy' and not os.environ.get('AUTOMODE_MODEL') and MODEL != AGY_GEMINI_FALLBACK
+    can_quota_fallback = can_claude_fallback or can_gemini_fallback
     if BACKEND == 'agy':
-        if can_fallback and agy_in_auth_cooldown():
+        if can_claude_fallback and agy_in_auth_cooldown():
             allowed, reason, reused = classify_claude(prompt_or_ctx, conversation_id,
                                                       model=DEFAULT_MODELS['claude'], deadline=deadline)
             return allowed, reason, {'backend': 'claude', 'reused': reused}
+        if can_quota_fallback and agy_in_quota_cooldown():
+            return _classify_quota_fallback(prompt_or_ctx, conversation_id, deadline,
+                                            can_claude_fallback, can_gemini_fallback)
         try:
-            if isinstance(prompt_or_ctx, dict):
-                allowed, reason, reused = classify_agy_cached(prompt_or_ctx, conversation_id, deadline=deadline)
-            else:
-                allowed, reason = classify_agy(prompt_or_ctx, deadline=deadline)
-                reused = False
+            allowed, reason, reused = _classify_agy_with_model(prompt_or_ctx, conversation_id, MODEL, deadline)
             return allowed, reason, {'backend': 'agy', 'reused': reused}
         except Exception as exc:
-            if can_fallback and is_auth_error(exc):
+            if can_claude_fallback and is_auth_error(exc):
                 mark_agy_auth_failed()
                 allowed, reason, reused = classify_claude(prompt_or_ctx, conversation_id,
                                                           model=DEFAULT_MODELS['claude'], deadline=deadline)
                 return allowed, reason, {'backend': 'claude', 'reused': reused}
+            if can_quota_fallback and is_quota_error(exc):
+                mark_agy_quota_failed()
+                return _classify_quota_fallback(prompt_or_ctx, conversation_id, deadline,
+                                                can_claude_fallback, can_gemini_fallback)
             raise
     allowed, reason, reused = classify_claude(prompt_or_ctx, conversation_id, deadline=deadline)
     return allowed, reason, {'backend': 'claude', 'reused': reused}
@@ -1260,7 +1381,9 @@ def main():
         except Exception:
             fail_closed = True
         if fail_closed:
-            hint = " Run 'agy' once in a terminal to sign in, or set AUTOMODE_BACKEND=claude." if is_auth_error(error) else ''
+            hint = (" Run 'agy' once in a terminal to sign in, or set AUTOMODE_BACKEND=claude." if is_auth_error(error)
+                    else f' Set AUTOMODE_BACKEND=claude or AUTOMODE_MODEL={AGY_GEMINI_FALLBACK}.' if is_quota_error(error)
+                    else '')
             print(json.dumps({
                 'decision': 'deny',
                 'reason': f'Blocked by auto mode: classifier failed ({msg}); refusing to fail open with command(*).{hint}',
